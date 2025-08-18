@@ -1,4 +1,6 @@
 import os, sys
+from dotenv import load_dotenv
+load_dotenv()
 # Si 'cvcompat' est à côté de ce fichier :
 sys.path.append(os.path.dirname(__file__))
 

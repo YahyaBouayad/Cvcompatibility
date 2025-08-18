@@ -1,4 +1,6 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 TEAMTAILOR_BASE_URL = os.getenv("TEAMTAILOR_BASE_URL", "https://api.teamtailor.com/v1/")
 TEAMTAILOR_API_KEY = os.getenv("TEAMTAILOR_API_KEY", "")
