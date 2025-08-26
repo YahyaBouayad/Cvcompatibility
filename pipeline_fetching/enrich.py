@@ -1,10 +1,10 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
-from .teamtailor import TTClient
-from .storage import BlobStore
-from .state import StateStore
-from .mime_utils import extension_from_mime
+from teamtailor import TTClient
+from storage import BlobStore
+from state import StateStore
+from mime_utils import extension_from_mime
 import requests
 import logging
 

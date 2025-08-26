@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from . import config
+import config
 
 class BlobStore:
     def __init__(self, conn_str: Optional[str] = None, container: Optional[str] = None):

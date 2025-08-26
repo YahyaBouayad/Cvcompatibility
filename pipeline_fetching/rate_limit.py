@@ -1,9 +1,10 @@
 import time
 import threading
+from typing import Optional
 
 class TokenBucket:
     """Simple rate limiter thread-safe."""
-    def __init__(self, rate_per_sec: float, capacity: float | None = None):
+    def __init__(self, rate_per_sec: float, capacity: Optional[float] = None):
         self.rate = float(rate_per_sec)
         self.capacity = capacity if capacity is not None else max(1.0, self.rate * 2)
         self._tokens = self.capacity

@@ -2,8 +2,8 @@ from __future__ import annotations
 from typing import Dict, Iterable, Optional, Any
 import requests
 from tenacity import retry, wait_exponential_jitter, stop_after_attempt, retry_if_exception
-from .rate_limit import TokenBucket
-from . import config
+from rate_limit import TokenBucket
+import config
 
 class TTError(Exception):
     pass
@@ -31,44 +31,41 @@ class TTClient:
         retry=retry_if_exception(_is_retryable),
         reraise=True
     )
-    def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        self.bucket.acquire()
-        url = self.base_url + endpoint.lstrip("/")
-        resp = self.session.get(url, headers=self.headers, params=params, timeout=30)
-        if resp.status_code == 429:
-            raise TTError(f"429 rate limit: {resp.text}")
-        if resp.status_code >= 500:
-            raise TTError(f"{resp.status_code}: {resp.text}")
-        if not resp.ok:
-            raise TTError(f"{resp.status_code}: {resp.text}")
-        return resp.json()
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None):
+        self.bucket.acquire(1)
+        url = self.base_url + path.lstrip("/")
+        r = self.session.get(url, headers=self.headers, params=params, timeout=30)
+        if r.status_code == 429:
+            # laisser Tenacity remonter une exception retryable :
+            raise TTError("429 Too Many Requests")
+        if r.status_code >= 400:
+            raise TTError(f"HTTP {r.status_code}: {r.text}")
+        return r.json()
 
-    def list_resource(
-        self,
-        resource: str,
-        per_page: int = 100,
-        status: Optional[str] = None,
-        include: Optional[list[str]] = None,
-        extra_params: Optional[Dict[str, Any]] = None,
-    ) -> Iterable[Dict[str, Any]]:
-        page = 1
-        params: Dict[str, Any] = {"per_page": per_page, "page": page}
-        if status:
-            params["status[]"] = status
-            params["status"] = status
+    def list_resource(self, resource: str, per_page: int = 100, include=None, extra_params=None):
+        params = {"per_page": per_page}
         if include:
+            # JSON:API attend une liste séparée par des virgules, *avec* des tirets
             params["include"] = ",".join(include)
         if extra_params:
-            params.update(extra_params)
+            params.update(extra_params or {})
+
+        page = 1
         while True:
             params["page"] = page
-            data = self._get(resource, params=params)
-            items = data.get("data", [])
-            if not items:
-                break
-            for item in items:
+            self.bucket.acquire(1)
+            r = self.session.get(self.base_url + resource, headers=self.headers, params=params, timeout=30)
+            if r.status_code == 400:
+                # aide au debug en cas d'include invalide
+                raise RuntimeError(f"[400] Invalid include for {resource}: {r.text}")
+            r.raise_for_status()
+            data = r.json()
+            for item in data.get("data", []):
                 yield item
+            if not data.get("links", {}).get("next"):
+                break
             page += 1
+
 
     def get_entity(self, resource: str, entity_id: str | int, include: Optional[list[str]] = None) -> Dict[str, Any]:
         params = {}

@@ -15,7 +15,20 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
 
 # Includes par défaut pour l’enrichissement
 INCLUDES = {
-    "job-applications": ["candidate", "job", "stage", "reject-reason"],
-    "candidates": ["applications", "tags", "uploads", "custom-field-values"],
-    "jobs": ["company", "locations", "department"],
+    "job-applications": ["candidate",
+    "job",
+    "stage",
+    "reject-reason",
+    "nps-responses"],
+
+    "candidates": [
+    "job-applications",
+    "activities",
+    "answers",
+    "questions",
+    "form-answers",
+    "custom-field-values",
+    "uploads"],
+
+    "jobs": ["activities", "candidates", "stages", "team-memberships", "custom-fields"],
 }

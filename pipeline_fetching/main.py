@@ -1,13 +1,16 @@
+# main.py
 import os, sys
 from dotenv import load_dotenv
 load_dotenv()
-# Si 'cvcompat' est à côté de ce fichier :
+
 sys.path.append(os.path.dirname(__file__))
 
-from .pipeline import run as run_pipeline
+from logging_utils import setup_logger
+setup_logger()  # <— ajouter cette ligne
+
+from pipeline import run as run_pipeline
 
 if __name__ == "__main__":
-    # Lis tes variables d'env depuis le Job (recommandé) ou définir ici par défaut
     run_pipeline(
         what="all",
         resources=os.getenv("RESOURCES", "candidates,jobs,job-applications"),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Dict, Any
-from .storage import BlobStore
+from storage import BlobStore
 
 class StateStore:
     def __init__(self, store: BlobStore):
