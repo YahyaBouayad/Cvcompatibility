@@ -1,20 +1,26 @@
-from __future__ import annotations
-from typing import Dict, Any
+import json
+from typing import Dict
 from storage import BlobStore
 
 class StateStore:
+    """
+    Petit store JSON dans le Blob : state/<name>.json
+    """
     def __init__(self, store: BlobStore):
         self.store = store
 
-    def _path(self, resource: str) -> str:
-        return f"tt/state/{resource}.json"
+    def _path(self, name: str) -> str:
+        return f"state/{name}.json"
 
-    def load(self, resource: str) -> Dict[str, Any]:
-        path = self._path(resource)
+    def load(self, name: str) -> Dict:
+        p = self._path(name)
+        if not self.store.exists(p):
+            return {}
         try:
-            return self.store.download_json(path)
+            return self.store.download_json(p)
         except Exception:
-            return {"last_run_ts": None, "items": 0, "last_updated_at": None}
+            return {}
 
-    def save(self, resource: str, state: Dict[str, Any]):
-        self.store.upload_json(self._path(resource), state)
+    def save(self, name: str, obj: Dict):
+        p = self._path(name)
+        self.store.upload_json(p, obj)
