@@ -16,6 +16,8 @@ from io import StringIO
 
 # --- LLM: Azure OpenAI  ---
 from openai import AzureOpenAI
+import zipfile
+
 
 
 
@@ -29,7 +31,8 @@ AOAI_TPM=60000      # 60k tokens/min (à adapter à ton quota réel)
 AOAI_MIN_WAIT=1.0
 CV_TEXT_MAX_CHARS=16000
 
-INCLUDE_UPLOADS_ONLY = os.getenv("CV_INCLUDE_UPLOADS_ONLY", "1") == "1"
+#INCLUDE_UPLOADS_ONLY = os.getenv("CV_INCLUDE_UPLOADS_ONLY", "1") == "1"
+INCLUDE_UPLOADS_ONLY=0
 OUTPUT_BLOB_PREFIX = os.getenv("OUTPUT_BLOB_PREFIX", "processed/segmentation")
 # ====================================
 
@@ -100,18 +103,27 @@ def upload_text(container_client, text: str, dest_name: str, content_type: str):
     upload_bytes(container_client, text.encode("utf-8"), dest_name, content_type=content_type)
 
 def list_cv_blobs(container_client, prefix: str, limit: Optional[int] = None) -> List[str]:
-    exts = (".pdf", ".docx", ".txt", ".bin")
+    """
+    Liste TOUS les blobs sous le préfixe (on ne filtre plus par extension).
+    Optionnellement, on peut encore filtrer sur '/uploads/' via CV_INCLUDE_UPLOADS_ONLY.
+    """
     names = []
     for b in container_client.list_blobs(name_starts_with=prefix or ""):
         name = b.name
-        lname = name.lower()
-        if INCLUDE_UPLOADS_ONLY and "/uploads/" not in lname:
+        if INCLUDE_UPLOADS_ONLY and "/uploads/" not in name.lower():
             continue
-        if lname.endswith(exts):
-            names.append(name)
-            if limit and len(names) >= limit:
-                break
+        names.append(name)
+        if limit and len(names) >= limit:
+            break
+
+    # petit log de debug pour vérifier
+    print(f"   → {len(names)} blobs trouvés sous '{prefix}' (uploads_only={INCLUDE_UPLOADS_ONLY})")
+    for n in names[:5]:
+        print(f"     - {n}")
+    if not names and INCLUDE_UPLOADS_ONLY:
+        print("   (hint) Aucun blob trouvé avec le filtre '/uploads/'. Mets CV_INCLUDE_UPLOADS_ONLY=0")
     return names
+
 
 def download_blob_to_bytes(container_client, blob_name: str) -> bytes:
     return container_client.download_blob(blob_name).readall()
@@ -143,17 +155,41 @@ def extract_text_from_txt_bytes(data: bytes, encoding="utf-8", fallback="latin-1
     except UnicodeDecodeError:
         return data.decode(fallback, errors="ignore")
 
+def looks_like_docx_bytes(data: bytes) -> bool:
+    # .docx = zip avec 'word/document.xml'
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=True) as tmp:
+            tmp.write(data); tmp.flush()
+            if not zipfile.is_zipfile(tmp.name):
+                return False
+            with zipfile.ZipFile(tmp.name) as z:
+                names = z.namelist()
+                return ("word/document.xml" in names) or ("[Content_Types].xml" in names)
+    except Exception:
+        return False
+
 def extract_cv_text(blob_name: str, data: bytes) -> str:
-    name = blob_name.lower()
-    if name.endswith(".pdf") or (name.endswith(".bin") and is_pdf_bytes(data)):
+    lname = blob_name.lower()
+
+    # 1) PDF par signature
+    if is_pdf_bytes(data) or lname.endswith(".pdf") or (lname.endswith(".bin") and is_pdf_bytes(data)):
         return extract_text_from_pdf_bytes(data)
-    elif name.endswith(".docx"):
+
+    # 2) DOCX par signature zip
+    if lname.endswith(".docx") or looks_like_docx_bytes(data):
         return extract_text_from_docx_bytes(data)
-    elif name.endswith(".txt"):
+
+    # 3) TXT sinon (tentative de décodage)
+    if lname.endswith(".txt"):
         return extract_text_from_txt_bytes(data)
+
+    # 4) Fallback auto: PDF ? DOCX ? sinon texte
     if is_pdf_bytes(data):
         return extract_text_from_pdf_bytes(data)
+    if looks_like_docx_bytes(data):
+        return extract_text_from_docx_bytes(data)
     return extract_text_from_txt_bytes(data)
+
 
 
 # -------- Nettoyage --------
