@@ -489,7 +489,7 @@ def run_pipeline(
 def parse_args():
     p = argparse.ArgumentParser(description="Pipeline 02 - Segmentation CV via Azure OpenAI (Blob-only)")
     p.add_argument("--prefix", default=os.getenv("CV_BLOB_PREFIX", ""), help="Préfixe des chemins de CV dans le container")
-    p.add_argument("--limit", type=int, default=10, help="Limiter le nombre de CV traités")
+    p.add_argument("--limit", type=int, default=50, help="Limiter le nombre de CV traités")
     p.add_argument("--force", action="store_true", help="Reparser même si déjà présent dans le blob")
     return p.parse_args()
 
