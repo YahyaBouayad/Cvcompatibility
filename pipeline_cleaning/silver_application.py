@@ -179,9 +179,23 @@ def build_application_row(doc: Dict[str, Any], job_lut: Dict[str, Dict[str, Any]
     reject_reason_text = None
     for i in inc:
         if i.get("type") == "stages" and i.get("id") == stage_id:
-            stage_name = safe_get(i, ["attributes","name"])
+            stage_name = safe_get(i, ["attributes", "name"])
         if i.get("type") == "reject-reasons" and i.get("id") == reject_reason_id:
-            reject_reason_text = safe_get(i, ["attributes","name"]) or safe_get(i, ["attributes","title"]) or safe_get(i, ["attributes","text"])
+            # ✅ Teamtailor met le libellé ici
+            reject_reason_text = (
+                safe_get(i, ["attributes", "reason"])  # <— la bonne clé
+                or safe_get(i, ["attributes", "name"])
+                or safe_get(i, ["attributes", "title"])
+                or safe_get(i, ["attributes", "text"])
+            )
+
+    # Fallback si le texte est porté par l'application elle-même (certaines versions/exports)
+    if not reject_reason_text:
+        reject_reason_text = (
+            safe_get(a, ["reject-reason-text"])
+            or safe_get(a, ["reject_reason_text"])
+            or safe_get(a, ["reject-reason"])  # par prudence
+        )
 
     created_at = to_iso(a.get("created-at"))
     updated_at = to_iso(a.get("updated-at"))
