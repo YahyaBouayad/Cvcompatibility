@@ -22,14 +22,18 @@ import zipfile
 
 
 # ============== CONFIG ==============
-# IMPORTANT: côté Azure OpenAI, "model" (param API) = NOM DU DEPLOYMENT
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+# ============== CONFIG ==============
+# IMPORTANT: côté Azure OpenAI, "model" (param API) = NOM DU DEPLOYMENT (pas le nom public)
+# Valeurs par défaut adaptées à ton nouveau modèle (gpt-4o - 2024-08-06)
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
-AOAI_RPM=1          # 1 requête/minute
-AOAI_TPM=60000      # 60k tokens/min (à adapter à ton quota réel)
-AOAI_MIN_WAIT=1.0
-CV_TEXT_MAX_CHARS=16000
+# Limites quota (env → override). "capacité : 140" ≈ RPM=140 ; "débit max : 140000" ≈ TPM=140_000
+AOAI_RPM = int(os.getenv("AOAI_RPM", "140"))
+AOAI_TPM = int(os.getenv("AOAI_TPM", "140000"))
+AOAI_MIN_WAIT = float(os.getenv("AOAI_MIN_WAIT", "0.5"))   # petite latence mini entre appels
+
+CV_TEXT_MAX_CHARS = int(os.getenv("CV_TEXT_MAX_CHARS", "16000"))
 
 #INCLUDE_UPLOADS_ONLY = os.getenv("CV_INCLUDE_UPLOADS_ONLY", "1") == "1"
 INCLUDE_UPLOADS_ONLY=0
@@ -209,12 +213,13 @@ def get_azure_client() -> AzureOpenAI:
     if not AZURE_OPENAI_DEPLOYMENT:
         print("[CONFIG] AZURE_OPENAI_DEPLOYMENT vide (mettre le NOM du déploiement Azure).")
         sys.exit(2)
-    print(f"[AZURE] endpoint={endpoint} deployment={AZURE_OPENAI_DEPLOYMENT} api={AZURE_OPENAI_API_VERSION}")
+    print(f"[AZURE] endpoint={endpoint} | deployment={AZURE_OPENAI_DEPLOYMENT} | api={AZURE_OPENAI_API_VERSION} "f"| rpm={AOAI_RPM} | tpm={AOAI_TPM}")
     return AzureOpenAI(api_key=api_key, azure_endpoint=endpoint, api_version=AZURE_OPENAI_API_VERSION)
 
 def _estimate_tokens(text: str) -> int:
     # approx grossière : 1 token ≈ 4 caractères en moyenne.
-    return max(1, int(len(text) / 4))
+    # Légère majoration pour rester prudent sur TPM.
+    return max(1, int(len(text) / 3.6))
 
 def _throttle_before_call(prompt_tokens: int, completion_tokens_budget: int = 800):
     """
@@ -314,9 +319,9 @@ Consignes:
 
     def _do():
         return client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,         # NOM DU DEPLOYMENT Azure
+            model=AZURE_OPENAI_DEPLOYMENT,         # NOM DU DÉPLOIEMENT Azure
             temperature=0.1,
-            response_format={"type": "json_object"},
+            response_format={"type": "json_object"},  # OK avec 2024-08-06
             # Limite la taille de sortie pour mieux respecter TPM
             max_tokens=600,
             messages=[
@@ -489,9 +494,26 @@ def run_pipeline(
 def parse_args():
     p = argparse.ArgumentParser(description="Pipeline 02 - Segmentation CV via Azure OpenAI (Blob-only)")
     p.add_argument("--prefix", default=os.getenv("CV_BLOB_PREFIX", ""), help="Préfixe des chemins de CV dans le container")
-    p.add_argument("--limit", type=int, default=50, help="Limiter le nombre de CV traités")
+    p.add_argument("--limit", type=int, default=1000, help="Limiter le nombre de CV traités")
     p.add_argument("--force", action="store_true", help="Reparser même si déjà présent dans le blob")
     return p.parse_args()
+
+def test_llm_connectivity(client: AzureOpenAI) -> None:
+    """Effectue un appel minimal au LLM pour valider la connectivité/config.
+    Lève une Exception en cas d'échec."""
+    try:
+        _ = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            temperature=0.0,
+            max_tokens=5,
+            messages=[
+                {"role": "system", "content": "You are a ping probe. Reply with OK."},
+                {"role": "user", "content": "Ping"},
+            ],
+        )
+    except Exception as e:
+        raise RuntimeError(f"Échec connexion LLM/deployment='{AZURE_OPENAI_DEPLOYMENT}' api='{AZURE_OPENAI_API_VERSION}': {e}")
+
 
 
 def main():
@@ -510,6 +532,14 @@ def main():
     print(f"   Limit     : {args.limit or '(illimité)'}")
     print(f"   Force     : {args.force}")
     print(f"   Output    : {OUTPUT_BLOB_PREFIX}/...")
+
+    try:
+        client = get_azure_client()
+        test_llm_connectivity(client)
+        print("✅ Connexion LLM OK")
+    except Exception as e:
+        print(f"❌ Connexion LLM échouée: {e}")
+        sys.exit(1)
 
     run_pipeline(
         conn_str=conn_str,

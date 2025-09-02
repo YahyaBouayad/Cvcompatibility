@@ -1,4 +1,3 @@
-# … (imports et tout le haut de ton script inchangés) …
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -338,7 +337,7 @@ for chunk in rows:
 # Debug (optionnel)
 with st.expander("🔬 Diagnostic (schémas détectés)"):
     st.write("**Colonnes jobs**:", list(df_jobs.columns)); st.json(df_jobs.head(1).to_dict(orient="records"))
-    st.write("**Colonnes job applications**:", list(df_apps.columns)); st.dataframe(df_apps.head(10))
+    st.write("**Colonnes job applications**:", list(df_apps.columns)); st.dataframe(df_apps)
     st.write("**Colonnes candidates**:", list(df_cands.columns)); st.dataframe(df_cands[["candidate_id","full_name","location","email","phone","linkedin_url","source_site"]].head(10))
 
 st.caption("ℹ️ Cache 5 min. POC : lecture blobs Silver uniquement (JSONL).")
