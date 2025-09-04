@@ -1,126 +1,157 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, io, json, argparse, tempfile, sys, time, random
+import os, re, io, json, argparse, tempfile, sys, time, hashlib, threading
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from dotenv import load_dotenv
+from datetime import datetime
 
-# --- IO / Fichiers ---
-from azure.storage.blob import BlobServiceClient
-from azure.storage.blob import ContentSettings
-from pypdf import PdfReader
-import docx2txt
-import pandas as pd
-from io import StringIO
+# --- Chargement .env ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-# --- LLM: Azure OpenAI  ---
-from openai import AzureOpenAI
-import zipfile
+# --- IO / Fichiers / Azure ---
+from azure.storage.blob import BlobServiceClient, ContentSettings
 
+# --- PDF / DOCX ---
+try:
+    import fitz  # PyMuPDF (rapide)
+    _has_pymupdf = True
+except Exception:
+    _has_pymupdf = False
 
+try:
+    from pypdf import PdfReader
+    _has_pypdf = True
+except Exception:
+    _has_pypdf = False
 
+try:
+    import docx2txt
+    _has_docx = True
+except Exception:
+    _has_docx = False
+
+# --- Data utils ---
+try:
+    import pandas as pd
+    _has_pandas = True
+except Exception:
+    _has_pandas = False
+
+# --- Azure OpenAI ---
+try:
+    from openai import AzureOpenAI
+except Exception as e:
+    print("❌ openai (AzureOpenAI) n’est pas installé. pip install openai>=1.40.0")
+    raise
 
 # ============== CONFIG ==============
-# ============== CONFIG ==============
-# IMPORTANT: côté Azure OpenAI, "model" (param API) = NOM DU DEPLOYMENT (pas le nom public)
-# Valeurs par défaut adaptées à ton nouveau modèle (gpt-4o - 2024-08-06)
+# Azure OpenAI
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+# Limites quota (env → override)
+AOAI_RPM = int(os.getenv("AOAI_RPM", "140"))            # ex. 140
+AOAI_TPM = int(os.getenv("AOAI_TPM", "140000"))         # ex. 140_000
+MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "600"))
 
-# Limites quota (env → override). "capacité : 140" ≈ RPM=140 ; "débit max : 140000" ≈ TPM=140_000
-AOAI_RPM = int(os.getenv("AOAI_RPM", "140"))
-AOAI_TPM = int(os.getenv("AOAI_TPM", "140000"))
-AOAI_MIN_WAIT = float(os.getenv("AOAI_MIN_WAIT", "0.5"))   # petite latence mini entre appels
+# Entrée / sortie Blob
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+BLOB_CONTAINER = os.getenv("BLOB_CONTAINER", "cvcompat")
+INPUT_PREFIX = os.getenv("INPUT_PREFIX", "tt/files/candidates/")  # où sont les CV
+OUTPUT_BLOB_PREFIX = os.getenv("OUTPUT_BLOB_PREFIX", "processed/segmentation")
 
+# Filtrage fichiers
+INCLUDE_UPLOADS_ONLY = os.getenv("CV_INCLUDE_UPLOADS_ONLY", "0") == "1"  # filtre '/uploads/'
+EXTS = os.getenv("CV_EXTS", "pdf,docx,txt").lower().split(",")
+
+# Taille texte
 CV_TEXT_MAX_CHARS = int(os.getenv("CV_TEXT_MAX_CHARS", "16000"))
 
-#INCLUDE_UPLOADS_ONLY = os.getenv("CV_INCLUDE_UPLOADS_ONLY", "1") == "1"
-INCLUDE_UPLOADS_ONLY=0
-OUTPUT_BLOB_PREFIX = os.getenv("OUTPUT_BLOB_PREFIX", "processed/segmentation")
-# ====================================
+# Concurrence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+LLM_WORKERS = int(os.getenv("LLM_WORKERS", "4"))
+MAX_DOWNLOAD_CONCURRENCY = int(os.getenv("BLOB_MAX_CONCURRENCY", "4"))
 
-SECTION_SCHEMA = [
-    "profile_summary",
-    "experiences",
-    "education",
-    "skills",
-    "languages",
-    "certifications",
-    "projects",
-    "tools_and_technologies",
-    "achievements",
-    "interests"
-]
+# Résumés (optionnels)
+SAVE_SUMMARIES = os.getenv("SAVE_SUMMARIES", "1") == "1"
 
-SUMMARY_FIELDS = [
-    "candidate_id",
-    "full_name",
-    "title_or_role",
-    "total_years_experience",
-    "last_company",
-    "last_title",
-    "highest_degree",
-    "languages_summary",
-    "main_skills_top5",
-]
+# ============== TOKEN ESTIMATION ==============
+try:
+    import tiktoken
+    _enc = tiktoken.get_encoding("cl100k_base")
+    def estimate_tokens(txt: str) -> int:
+        return len(_enc.encode(txt))
+    def truncate_by_tokens(txt: str, max_tokens: int) -> str:
+        ids = _enc.encode(txt)
+        if len(ids) <= max_tokens:
+            return txt
+        return _enc.decode(ids[:max_tokens])
+except Exception:
+    def estimate_tokens(txt: str) -> int:
+        return max(1, int(len(txt) / 3.6))  # fallback grossier
+    def truncate_by_tokens(txt: str, max_tokens: int) -> str:
+        # fallback grossier (~4 chars/token)
+        return txt[:max_tokens * 4]
 
-OUT_DIR = Path("out_segmentation")
-OUT_JSON_DIR = OUT_DIR / "cv_json"
-OUT_JSONL = OUT_DIR / "cv_parsed_full.jsonl"
-OUT_CSV = OUT_DIR / "cv_parsed_summary.csv"
+# ============== RATE LIMITER GLOBAL ==============
+class RateLimiter:
+    def __init__(self, rpm: int, tpm: int):
+        self.rpm = max(1, rpm)
+        self.tpm = max(1, tpm)
+        self._lock = threading.Lock()
+        self._call_times = []   # timestamps des appels (RPM, fenêtre 60s)
+        self._tpm_used = 0      # tokens utilisés dans la fenêtre courante
+        self._window_start = time.time()
 
+    def acquire(self, prompt_tokens: int, completion_budget: int):
+        need = prompt_tokens + completion_budget
+        while True:
+            with self._lock:
+                now = time.time()
+                # reset fenêtre TPM chaque 60s
+                if now - self._window_start >= 60.0:
+                    self._window_start = now
+                    self._tpm_used = 0
+                # purge RPM
+                self._call_times = [t for t in self._call_times if now - t < 60.0]
 
-# --- CLI ---
-def require_env(varname: str) -> str:
-    v = os.getenv(varname, "")
-    if not v:
-        print(f"[CONFIG] ENV manquant: {varname}")
-        sys.exit(2)
-    return v
+                rpm_ok = (len(self._call_times) < self.rpm)
+                tpm_ok = (self._tpm_used + need <= self.tpm)
 
+                if rpm_ok and tpm_ok:
+                    self._tpm_used += need
+                    self._call_times.append(now)
+                    return
+                # attendre le plus bloquant
+                sleep_rpm = 0.0
+                if not rpm_ok and self._call_times:
+                    sleep_rpm = 60.0 - (now - self._call_times[0]) + 0.01
+                sleep_tpm = 0.0
+                if not tpm_ok:
+                    sleep_tpm = 60.0 - (now - self._window_start) + 0.01
+            time.sleep(max(0.05, sleep_rpm, sleep_tpm))
 
-# --------- Azure Blob helpers ---------
-def get_container_client(connection_string: str, container: str):
-    svc = BlobServiceClient.from_connection_string(connection_string)
-    return svc.get_container_client(container)
+rate_limiter = RateLimiter(AOAI_RPM, AOAI_TPM)
 
-def blob_exists(container_client, name: str) -> bool:
-    try:
-        return container_client.get_blob_client(name).exists()
-    except Exception:
-        return False
-
-def upload_bytes(container_client, data: bytes, dest_name: str, content_type: str):
-    container_client.upload_blob(
-        name=dest_name,
-        data=data,
-        overwrite=True,
-        content_settings=ContentSettings(content_type=content_type, cache_control="no-cache"),
-    )
-
-def upload_json(container_client, obj: Dict[str, Any], dest_name: str):
-    data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
-    upload_bytes(container_client, data, dest_name, content_type="application/json")
-
-def upload_text(container_client, text: str, dest_name: str, content_type: str):
-    upload_bytes(container_client, text.encode("utf-8"), dest_name, content_type=content_type)
-
-def list_cv_blobs(container_client, prefix: str, limit: Optional[int] = None) -> List[str]:
-    """
-    Liste TOUS les blobs sous le préfixe (on ne filtre plus par extension).
-    Optionnellement, on peut encore filtrer sur '/uploads/' via CV_INCLUDE_UPLOADS_ONLY.
-    """
+# ============== BLOB HELPERS ==============
+def list_blobs_flat(container_client, prefix: str = "", limit: Optional[int] = None) -> List[str]:
     names = []
     for b in container_client.list_blobs(name_starts_with=prefix or ""):
         name = b.name
         if INCLUDE_UPLOADS_ONLY and "/uploads/" not in name.lower():
             continue
+        # filtre extensions si on a un fichier final (…/xxx.pdf) ou nom sans extension
+        base = name.rsplit("/", 1)[-1].lower()
+        ext = base.rsplit(".", 1)[-1] if "." in base else ""
+        if EXTS and ext and ext not in EXTS:
+            continue
         names.append(name)
         if limit and len(names) >= limit:
             break
-
-    # petit log de debug pour vérifier
     print(f"   → {len(names)} blobs trouvés sous '{prefix}' (uploads_only={INCLUDE_UPLOADS_ONLY})")
     for n in names[:5]:
         print(f"     - {n}")
@@ -128,204 +159,192 @@ def list_cv_blobs(container_client, prefix: str, limit: Optional[int] = None) ->
         print("   (hint) Aucun blob trouvé avec le filtre '/uploads/'. Mets CV_INCLUDE_UPLOADS_ONLY=0")
     return names
 
-
 def download_blob_to_bytes(container_client, blob_name: str) -> bytes:
-    return container_client.download_blob(blob_name).readall()
-# -------- Extraction texte --------
+    blob = container_client.get_blob_client(blob_name)
+    return blob.download_blob(max_concurrency=MAX_DOWNLOAD_CONCURRENCY).readall()
+
+def upload_json_to_blob(container_client, name: str, data: dict):
+    content = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    ct = ContentSettings(content_type="application/json; charset=utf-8")
+    container_client.upload_blob(name, content, overwrite=True, content_settings=ct)
+
+def upload_text_to_blob(container_client, name: str, text: str, content_type="text/plain; charset=utf-8"):
+    content = text.encode("utf-8")
+    ct = ContentSettings(content_type=content_type)
+    container_client.upload_blob(name, content, overwrite=True, content_settings=ct)
+
+# ============== EXTRACTION TEXTE ==============
 def is_pdf_bytes(data: bytes) -> bool:
     return data[:5] == b"%PDF-"
 
 def extract_text_from_pdf_bytes(data: bytes) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-        tmp.write(data); tmp.flush()
-        reader = PdfReader(tmp.name)
-        pages = []
-        for p in reader.pages:
+    if _has_pymupdf:
+        try:
+            doc = fitz.open(stream=data, filetype="pdf")
+            return "\n".join(page.get_text() or "" for page in doc)
+        except Exception:
+            pass
+    # fallback pypdf via fichier temporaire
+    if _has_pypdf:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+            tmp.write(data); tmp.flush()
             try:
-                pages.append(p.extract_text() or "")
+                reader = PdfReader(tmp.name)
+                return "\n".join([p.extract_text() or "" for p in reader.pages])
             except Exception:
-                pages.append("")
-        return "\n".join(pages)
+                pass
+    return ""
 
 def extract_text_from_docx_bytes(data: bytes) -> str:
+    if not _has_docx:
+        return ""
     with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
         tmp.write(data); tmp.flush()
-        text = docx2txt.process(tmp.name)
-        return text or ""
+        try:
+            return docx2txt.process(tmp.name) or ""
+        except Exception:
+            return ""
 
-def extract_text_from_txt_bytes(data: bytes, encoding="utf-8", fallback="latin-1") -> str:
+def extract_cv_text(blob_name: str, raw: bytes) -> str:
+    name = blob_name.lower()
+    if is_pdf_bytes(raw) or name.endswith(".pdf"):
+        return extract_text_from_pdf_bytes(raw)
+    if name.endswith(".docx"):
+        return extract_text_from_docx_bytes(raw)
+    # txt/unknown → essayer utf-8
     try:
-        return data.decode(encoding)
-    except UnicodeDecodeError:
-        return data.decode(fallback, errors="ignore")
-
-def looks_like_docx_bytes(data: bytes) -> bool:
-    # .docx = zip avec 'word/document.xml'
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=True) as tmp:
-            tmp.write(data); tmp.flush()
-            if not zipfile.is_zipfile(tmp.name):
-                return False
-            with zipfile.ZipFile(tmp.name) as z:
-                names = z.namelist()
-                return ("word/document.xml" in names) or ("[Content_Types].xml" in names)
+        return raw.decode("utf-8", "ignore")
     except Exception:
-        return False
+        return ""
 
-def extract_cv_text(blob_name: str, data: bytes) -> str:
-    lname = blob_name.lower()
-
-    # 1) PDF par signature
-    if is_pdf_bytes(data) or lname.endswith(".pdf") or (lname.endswith(".bin") and is_pdf_bytes(data)):
-        return extract_text_from_pdf_bytes(data)
-
-    # 2) DOCX par signature zip
-    if lname.endswith(".docx") or looks_like_docx_bytes(data):
-        return extract_text_from_docx_bytes(data)
-
-    # 3) TXT sinon (tentative de décodage)
-    if lname.endswith(".txt"):
-        return extract_text_from_txt_bytes(data)
-
-    # 4) Fallback auto: PDF ? DOCX ? sinon texte
-    if is_pdf_bytes(data):
-        return extract_text_from_pdf_bytes(data)
-    if looks_like_docx_bytes(data):
-        return extract_text_from_docx_bytes(data)
-    return extract_text_from_txt_bytes(data)
-
-
-
-# -------- Nettoyage --------
 def simple_clean(text: str) -> str:
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n\n", text)
+    if not text:
+        return ""
+    # supprime contrôles
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", " ", text)
+    # espaces multiples
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    # normalise retours ligne
+    text = re.sub(r"\r\n?", "\n", text)
     return text.strip()
 
-
-# -------- LLM (Azure OpenAI) --------
-def get_azure_client() -> AzureOpenAI:
-    api_key = require_env("AZURE_OPENAI_API_KEY")
-    endpoint = require_env("AZURE_OPENAI_ENDPOINT")
-    if not endpoint.startswith("https://") or "openai.azure.com" not in endpoint:
-        print(f"[CONFIG] AZURE_OPENAI_ENDPOINT invalide: {endpoint}")
+# ============== AZURE OPENAI CLIENT ==============
+def make_client() -> AzureOpenAI:
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+    api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+    if not endpoint or not api_key:
+        print("[CONFIG] Manque AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY.")
         sys.exit(2)
     if not AZURE_OPENAI_DEPLOYMENT:
-        print("[CONFIG] AZURE_OPENAI_DEPLOYMENT vide (mettre le NOM du déploiement Azure).")
+        print("[CONFIG] AZURE_OPENAI_DEPLOYMENT vide.")
         sys.exit(2)
-    print(f"[AZURE] endpoint={endpoint} | deployment={AZURE_OPENAI_DEPLOYMENT} | api={AZURE_OPENAI_API_VERSION} "f"| rpm={AOAI_RPM} | tpm={AOAI_TPM}")
+    print(f"[AZURE] endpoint={endpoint} | deployment={AZURE_OPENAI_DEPLOYMENT} "
+          f"| api_version={AZURE_OPENAI_API_VERSION} | rpm={AOAI_RPM} | tpm={AOAI_TPM}")
     return AzureOpenAI(api_key=api_key, azure_endpoint=endpoint, api_version=AZURE_OPENAI_API_VERSION)
 
-def _estimate_tokens(text: str) -> int:
-    # approx grossière : 1 token ≈ 4 caractères en moyenne.
-    # Légère majoration pour rester prudent sur TPM.
-    return max(1, int(len(text) / 3.6))
-
-def _throttle_before_call(prompt_tokens: int, completion_tokens_budget: int = 800):
-    """
-    Endort assez longtemps pour rester sous RPM/TPM.
-    - RPM -> intervalle mini entre appels = 60 / RPM secondes
-    - TPM -> on dort proportionnellement aux tokens qu'on va consommer
-    """
-    rpm_sleep = 60.0 / max(1, AOAI_RPM)
-    tpm_sleep = 60.0 * (prompt_tokens + completion_tokens_budget) / max(1, AOAI_TPM)
-    sleep_s = max(AOAI_MIN_WAIT, rpm_sleep, tpm_sleep)
-    time.sleep(sleep_s)
-
-def _sleep_from_429_message(msg: str):
-    """
-    Azure renvoie souvent 'Please retry after 60 seconds.' On parse et on dort.
-    """
-    # Cherche un entier juste avant 'second'
-    m = re.search(r"after\s+(\d+)\s*second", msg.lower())
+def _sleep_from_429_message(msg: str) -> float:
+    m = re.search(r"after\s+(\d+)\s*second", (msg or "").lower())
     if m:
-        secs = int(m.group(1)) + 2  # petite marge
-        print(f"   ⏳ 429 reçu: pause {secs}s")
-        time.sleep(secs)
-    else:
-        # fallback si pas d’indication
-        print("   ⏳ 429 reçu: pause 65s (fallback)")
-        time.sleep(65)
+        return float(m.group(1)) + 2.0
+    return 8.0  # valeur par défaut
 
-def _call_with_retry(func, max_retries=8, base_delay=2.0, jitter=0.25):
-    for attempt in range(max_retries):
+def _call_with_retry(fn, max_attempts: int = 5):
+    last = None
+    for k in range(1, max_attempts + 1):
         try:
-            return func()
+            return fn()
         except Exception as e:
-            msg = str(e)
-            low = msg.lower()
-
-            # 429 -> on respecte le "retry after", sinon backoff long
-            if " 429 " in f" {msg} " or "rate limit" in low:
-                _sleep_from_429_message(msg)
+            last = e
+            s = str(e)
+            if "429" in s or "rate limit" in s.lower():
+                sleep_s = _sleep_from_429_message(s)
+                print(f"   ⏳ 429 rate-limit, retry dans {sleep_s:.1f}s (tentative {k}/{max_attempts})")
+                time.sleep(sleep_s)
                 continue
-
-            retriable = any(k in low for k in ["timeout", "temporar", "service unavailable", "connection reset"])
-            if not retriable or attempt == max_retries - 1:
+            if k < max_attempts:
+                back = 2.0 * k
+                print(f"   ⏳ Erreur {type(e).__name__}: retry dans {back:.1f}s (tentative {k}/{max_attempts})")
+                time.sleep(back)
+            else:
                 raise
+    raise last
 
-            delay = min(base_delay * (2 ** attempt) * (1 + random.uniform(-jitter, jitter)), 30)
-            print(f"   ↻ Retry {attempt+2}/{max_retries} dans ~{delay:.1f}s - cause: {e}")
-            time.sleep(delay)
+# JSON Schema stricte pour la sortie
+CV_JSON_SCHEMA = {
+    "name": "cv_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "has_segmented_cv": {"type": "boolean"},
+            "profile": {
+                "type": "object",
+                "properties": {
+                    "full_name": {"type": ["string", "null"]},
+                    "title_or_role": {"type": ["string", "null"]},
+                    "summary": {"type": ["string", "null"]},
+                    "location": {"type": ["string", "null"]}
+                }
+            },
+            "experiences": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                    "company": {"type": "string"},
+                    "role": {"type": "string"},
+                    "start_date": {"type": "string"},
+                    "end_date": {"type": ["string", "null"]},
+                    "description": {"type": ["string", "null"]}
+                }
+            }},
+            "education": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                    "school": {"type": "string"},
+                    "degree": {"type": ["string", "null"]},
+                    "year": {"type": ["string", "null"]}
+                }
+            }},
+            "skills": {"type": "array", "items": {"type": "string"}},
+            "languages": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["has_segmented_cv"]
+    }
+}
 
-def llm_segment(cv_text: str, hint_name=None) -> dict:
-    client = get_azure_client()
+# LLM segmentation
+_client_singleton: Optional[AzureOpenAI] = None
+def get_client() -> AzureOpenAI:
+    global _client_singleton
+    if _client_singleton is None:
+        _client_singleton = make_client()
+    return _client_singleton
 
-    # Tronque le texte pour réduire la conso tokens (et donc limiter le 429)
-    cv_text = (cv_text or "")[:CV_TEXT_MAX_CHARS]
+def llm_segment(text: str) -> dict:
+    client = get_client()
+    # Tronquer par tokens pour rester dans TPM
+    # On réserve de la marge pour la sortie
+    max_prompt_tokens = max(256, AOAI_TPM // max(LLM_WORKERS, 1) - MAX_OUTPUT_TOKENS - 200)
+    text_cut = truncate_by_tokens(text[:CV_TEXT_MAX_CHARS], max_prompt_tokens)
 
-    prompt = f"""Tu es un assistant d'extraction d'informations de CV. Retourne STRICTEMENT du JSON valide.
-Schéma attendu:
-{{
-  "full_name": str | null,
-  "title_or_role": str | null,
-  "contacts": {{
-    "email": str | null, "phone": str | null, "location": str | null, "linkedin": str | null, "github": str | null, "other": [str]
-  }},
-  "profile_summary": str | null,
-  "experiences": [{{"company": str | null, "title": str | null, "start_date": str | null, "end_date": str | null, "duration_months": int | null, "location": str | null, "description": str | null, "tech": [str]}}],
-  "education": [{{"school": str | null, "degree": str | null, "field": str | null, "start_date": str | null, "end_date": str | null }}],
-  "skills": [str],
-  "languages": [{{"language": str, "level": str | null}}],
-  "certifications": [{{"name": str, "issuer": str | null, "date": str | null}}],
-  "projects": [{{"name": str, "description": str | null, "tech": [str]}}],
-  "tools_and_technologies": [str],
-  "achievements": [str],
-  "interests": [str],
-  "computed": {{
-    "total_years_experience": float | null,
-    "main_skills_top5": [str],
-    "last_company": str | null,
-    "last_title": str | null,
-    "highest_degree": str | null,
-    "languages_summary": str | null
-  }}
-}}
-Consignes:
-- Dates au format YYYY-MM quand possible.
-- Remplis 'computed' (approximation ok).
-- Si une info est introuvable, mets null (ne supprime aucun champ).
-- Réponds UNIQUEMENT avec le JSON.
-{('Nom supposé: ' + hint_name) if hint_name else ''}
+    prompt = (
+        "Tu extrais un CV en JSON STRICT selon le schéma fourni. "
+        "Si une section est absente dans le texte, renvoie un champ vide ([], {}). "
+        "N'invente pas d'informations.\n\n"
+        "=== TEXTE CV ===\n"
+        f"{text_cut}"
+    )
 
-=== CV TEXT START ===
-{cv_text}
-=== CV TEXT END ===
-"""
-
-    # Throttle proactif (RPM/TPM)
-    est_tokens = _estimate_tokens(prompt) + 600  # budget output ~600 tokens max
-    _throttle_before_call(est_tokens)
+    # Le rate-limiter global coordonne les threads
+    ptoks = estimate_tokens(prompt)
+    rate_limiter.acquire(ptoks, MAX_OUTPUT_TOKENS)
 
     def _do():
         return client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,         # NOM DU DÉPLOIEMENT Azure
-            temperature=0.1,
-            response_format={"type": "json_object"},  # OK avec 2024-08-06
-            # Limite la taille de sortie pour mieux respecter TPM
-            max_tokens=600,
+            model=AZURE_OPENAI_DEPLOYMENT,
+            temperature=0.0,
+            response_format={"type": "json_schema", "json_schema": CV_JSON_SCHEMA},
+            max_tokens=MAX_OUTPUT_TOKENS,
             messages=[
-                {"role": "system", "content": "You are a careful information extraction system. Output only valid JSON."},
+                {"role": "system", "content": "You are a careful information extraction system. Output STRICT JSON only."},
                 {"role": "user", "content": prompt}
             ],
         )
@@ -337,218 +356,201 @@ Consignes:
     except Exception:
         return {"raw_parse_error": content}
 
-# -------- Helpers candidat / fichiers --------
-CANDIDATE_ID_REGEX = re.compile(r"candidate[_/-](\d+)", re.IGNORECASE)
+# ============== HELPERS ID CANDIDAT ==============
+CANDIDATE_ID_PATTERNS = [
+    re.compile(r"/candidates/(\d+)/", re.IGNORECASE),
+    re.compile(r"candidate[_/-](\d+)", re.IGNORECASE),
+    re.compile(r"/(\d+)\.(pdf|docx|txt)$", re.IGNORECASE),
+]
 
 def candidate_id_from_blob(name: str) -> Optional[str]:
-    # 1) Cas Azure: .../candidates/<id>/...
-    parts = name.split("/")
-    for i, p in enumerate(parts):
-        if p.lower() == "candidates" and i + 1 < len(parts):
-            nxt = parts[i + 1]
-            if nxt.isdigit():
-                return nxt
+    for rgx in CANDIDATE_ID_PATTERNS:
+        m = rgx.search(name)
+        if m:
+            return m.group(1)
+    # fallback: si le dernier segment est numérique
+    last = name.rsplit("/", 1)[-1]
+    head = last.split(".", 1)[0]
+    if head.isdigit():
+        return head
+    return None
 
-    # 2) Cas historique: candidate_12345 / candidate-12345
-    m = CANDIDATE_ID_REGEX.search(name)
-    if m:
-        return m.group(1)
+def sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
-    # 3) Fallback: extraire un gros nombre dans le nom de fichier (ex: upload_61287010.pdf)
-    stem = Path(name).stem
-    m2 = re.search(r"(\d{6,})", stem)  # >= 6 chiffres
-    if m2:
-        return m2.group(1)
+def text_hash_in_blob(container_client, cand_id: str) -> str:
+    """Lire l'ancien JSON pour voir si le hash est identique. '' si absent."""
+    try:
+        dest_json = f"{OUTPUT_BLOB_PREFIX}/json/{cand_id}.json"
+        b = container_client.get_blob_client(dest_json)
+        if not b.exists():
+            return ""
+        raw = b.download_blob(max_concurrency=2).readall().decode("utf-8", "ignore")
+        obj = json.loads(raw)
+        return (obj.get("meta") or {}).get("text_hash", "")
+    except Exception:
+        return ""
 
-    # 4) Dernier recours: nom du fichier sans extension
-    return stem or None
+# ============== TRAITEMENT D’UN BLOB ==============
+def process_one_blob(container_client, blob_name: str, force: bool = False) -> Dict[str, Any]:
+    cand_id = candidate_id_from_blob(blob_name) or "unknown"
+    # 1) download
+    raw = download_blob_to_bytes(container_client, blob_name)
+    # 2) extract & clean
+    text = extract_cv_text(blob_name, raw)
+    text = simple_clean(text)
+    if not text:
+        raise RuntimeError("Texte vide après extraction.")
 
-def ensure_dirs():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_JSON_DIR.mkdir(parents=True, exist_ok=True)
+    # 2b) cache par hash
+    th = sha1(text)
+    if not force:
+        prev = text_hash_in_blob(container_client, cand_id)
+        if prev and prev == th:
+            return {"candidate_id": cand_id, "blob_name": blob_name, "skipped": True, "reason": "unchanged"}
 
-def already_done(candidate_id: str) -> bool:
-    return (OUT_JSON_DIR / f"{candidate_id}.json").exists()
+    # 3) LLM
+    parsed = llm_segment(text)
 
-def write_candidate_json(candidate_id: str, parsed: Dict[str, Any], meta: Dict[str, Any]):
-    payload = {"candidate_id": candidate_id, "parsed": parsed, "meta": meta}
-    with open(OUT_JSON_DIR / f"{candidate_id}.json", "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-def append_jsonl(records: List[Dict[str, Any]]):
-    mode = "a" if OUT_JSONL.exists() else "w"
-    with open(OUT_JSONL, mode, encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-def to_summary_row(candidate_id: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
-    comp = (parsed.get("computed") or {})
-    row = {
-        "candidate_id": candidate_id,
-        "full_name": parsed.get("full_name"),
-        "title_or_role": parsed.get("title_or_role"),
-        "total_years_experience": comp.get("total_years_experience"),
-        "last_company": comp.get("last_company"),
-        "last_title": comp.get("last_title"),
-        "highest_degree": comp.get("highest_degree"),
-        "languages_summary": comp.get("languages_summary"),
-        "main_skills_top5": ", ".join(comp.get("main_skills_top5") or []),
+    # 4) upload JSON
+    meta = {
+        "blob_name": blob_name,
+        "deployment": AZURE_OPENAI_DEPLOYMENT,
+        "api_version": AZURE_OPENAI_API_VERSION,
+        "ts": datetime.utcnow().isoformat(),
+        "text_hash": th,
     }
-    return row
+    payload = {"candidate_id": cand_id, "parsed": parsed, "meta": meta}
+    dest_json = f"{OUTPUT_BLOB_PREFIX}/json/{cand_id}.json"
+    upload_json_to_blob(container_client, dest_json, payload)
 
+    return {"candidate_id": cand_id, "blob_name": blob_name, "skipped": False, "json_blob": dest_json,
+            "has_segmented_cv": bool(parsed.get("has_segmented_cv"))}
 
-# --------- Pipeline ---------
-def run_pipeline(
-    conn_str: str,
-    container: str,
-    prefix: str,
-    limit: Optional[int] = None,
-    force: bool = False
-):
-    cont = get_container_client(conn_str, container)
+# ============== PIPELINE PRINCIPALE ==============
+def run_pipeline(conn_str: str, container: str, prefix: str, limit: Optional[int], force: bool):
+    svc = BlobServiceClient.from_connection_string(conn_str)
+    cont = svc.get_container_client(container)
 
-    blobs = list_cv_blobs(cont, prefix=prefix, limit=limit)
+    blobs = list_blobs_flat(cont, prefix=prefix, limit=limit)
     print(f"🔎 {len(blobs)} fichiers CV trouvés sous '{container}/{prefix}'")
 
-    summary_rows: List[Dict[str, Any]] = []
-    jsonl_lines: List[str] = []
+    results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
 
-    for i, blob_name in enumerate(blobs, 1):
-        print(f"\n[{i}/{len(blobs)}] Traitement: {blob_name}")
-        cand_id = candidate_id_from_blob(blob_name) or f"cand_{i}"
+    with ThreadPoolExecutor(max_workers=LLM_WORKERS) as exe:
+        futmap = {exe.submit(process_one_blob, cont, b, force): b for b in blobs}
+        for fut in as_completed(futmap):
+            b = futmap[fut]
+            try:
+                res = fut.result()
+                results.append(res)
+                if res.get("skipped"):
+                    print(f"   ⏭️  {res['candidate_id']} inchangé (skip).")
+                else:
+                    print(f"   ✅  {res['candidate_id']} → {res['json_blob']}")
+            except Exception as e:
+                print(f"   ⚠️  Erreur sur {b}: {e}")
+                err = {"blob_name": b, "error": str(e), "ts": datetime.utcnow().isoformat()}
+                errors.append(err)
+                try:
+                    err_name = f"{OUTPUT_BLOB_PREFIX}/errors/{int(time.time()*1000)}.json"
+                    upload_json_to_blob(cont, err_name, err)
+                except Exception:
+                    pass
 
-        # Skip si déjà présent dans le Blob (et pas de --force)
-        dest_json = f"{OUTPUT_BLOB_PREFIX}/json/{cand_id}.json"
-        if (not force) and blob_exists(cont, dest_json):
-            print(f"   ↳ SKIP (déjà présent dans le blob): {dest_json}")
-            continue
+    done = sum(1 for r in results if not r.get("skipped", False))
+    skipped = sum(1 for r in results if r.get("skipped", False))
+    print(f"\n🏁 Terminé: {done} traités, {skipped} ignorés (cache), {len(errors)} erreurs.")
 
-        # 1) Download
+    # Résumés optionnels
+    if SAVE_SUMMARIES:
+        # JSON résumé
+        summary = {
+            "ts": datetime.utcnow().isoformat(),
+            "prefix": prefix,
+            "limit": limit,
+            "force": force,
+            "rpm": AOAI_RPM,
+            "tpm": AOAI_TPM,
+            "workers": LLM_WORKERS,
+            "processed": done,
+            "skipped": skipped,
+            "errors": len(errors),
+            "container": container,
+        }
         try:
-            raw = download_blob_to_bytes(cont, blob_name)
-        except Exception as e:
-            print(f"   ⚠️  Téléchargement impossible: {e}")
-            continue
+            upload_json_to_blob(cont, f"{OUTPUT_BLOB_PREFIX}/summary/summary_{int(time.time())}.json", summary)
+        except Exception:
+            pass
 
-        # 2) Extraction texte
-        try:
-            text = extract_cv_text(blob_name, raw)
-            text = simple_clean(text)
-            if not text:
-                print("   ⚠️  Texte vide après extraction.")
-                continue
-        except Exception as e:
-            print(f"   ⚠️  Extraction texte KO: {e}")
-            continue
+        # CSV + JSONL (si pandas dispo)
+        if _has_pandas:
+            try:
+                rows = []
+                for r in results:
+                    rows.append({
+                        "candidate_id": r.get("candidate_id"),
+                        "skipped": r.get("skipped", False),
+                        "json_blob": r.get("json_blob", ""),
+                        "has_segmented_cv": r.get("has_segmented_cv", None),
+                    })
+                df = pd.DataFrame(rows)
+                csv_text = df.to_csv(index=False)
+                upload_text_to_blob(cont, f"{OUTPUT_BLOB_PREFIX}/cv_parsed_summary.csv", csv_text, content_type="text/csv; charset=utf-8")
+            except Exception:
+                pass
+        # JSONL complet minimal (payloads ne sont pas rechargés ici pour éviter de gros RAM)
+        # Option : on pourrait re-lire chaque JSON pour concaténer ; ici on reste léger.
 
-        # 3) LLM
-        try:
-            parsed = llm_segment(text, hint_name=None)
-            meta = {
-                "blob_name": blob_name,
-                "deployment": AZURE_OPENAI_DEPLOYMENT,
-                "api_version": AZURE_OPENAI_API_VERSION,
-                "ts": pd.Timestamp.utcnow().isoformat()
-            }
-            payload = {"candidate_id": cand_id, "parsed": parsed, "meta": meta}
-
-            # 4) Upload JSON candidat
-            upload_json(cont, payload, dest_json)
-            print(f"   ✅ Upload JSON → {dest_json}")
-
-            # 5) Accumulate pour JSONL/CSV
-            jsonl_lines.append(json.dumps({"candidate_id": cand_id, "blob": blob_name, "parsed": parsed}, ensure_ascii=False))
-            comp = parsed.get("computed") or {}
-            summary_rows.append({
-                "candidate_id": cand_id,
-                "full_name": parsed.get("full_name"),
-                "title_or_role": parsed.get("title_or_role"),
-                "total_years_experience": comp.get("total_years_experience"),
-                "last_company": comp.get("last_company"),
-                "last_title": comp.get("last_title"),
-                "highest_degree": comp.get("highest_degree"),
-                "languages_summary": comp.get("languages_summary"),
-                "main_skills_top5": ", ".join(comp.get("main_skills_top5") or []),
-            })
-
-        except Exception as e:
-            print(f"   ⚠️  LLM/Upload KO: {e}")
-            continue
-
-    # 6) Upload agrégats (overwrite à chaque run)
-    if jsonl_lines:
-        dest_jsonl = f"{OUTPUT_BLOB_PREFIX}/cv_parsed_full.jsonl"
-        upload_text(cont, "\n".join(jsonl_lines) + "\n", dest_jsonl, content_type="application/x-ndjson")
-        print(f"🧾 Upload JSONL → {dest_jsonl}")
-
-    if summary_rows:
-        df = pd.DataFrame(summary_rows)
-        csv_buf = StringIO()
-        df.to_csv(csv_buf, index=False, encoding="utf-8")
-        dest_csv = f"{OUTPUT_BLOB_PREFIX}/cv_parsed_summary.csv"
-        upload_text(cont, csv_buf.getvalue(), dest_csv, content_type="text/csv")
-        print(f"📄 Upload CSV → {dest_csv}")
-
-
-# --------- CLI ---------
-def parse_args():
-    p = argparse.ArgumentParser(description="Pipeline 02 - Segmentation CV via Azure OpenAI (Blob-only)")
-    p.add_argument("--prefix", default=os.getenv("CV_BLOB_PREFIX", ""), help="Préfixe des chemins de CV dans le container")
-    p.add_argument("--limit", type=int, default=1000, help="Limiter le nombre de CV traités")
-    p.add_argument("--force", action="store_true", help="Reparser même si déjà présent dans le blob")
-    return p.parse_args()
-
-def test_llm_connectivity(client: AzureOpenAI) -> None:
-    """Effectue un appel minimal au LLM pour valider la connectivité/config.
-    Lève une Exception en cas d'échec."""
+# ============== PING LLM AVANT LANCEMENT ==============
+def ping_llm_or_die():
     try:
-        _ = client.chat.completions.create(
+        client = get_client()
+        msg = "Réponds avec {\"ok\": true}."
+        resp = client.chat.completions.create(
             model=AZURE_OPENAI_DEPLOYMENT,
             temperature=0.0,
+            response_format={"type": "json_object"},
             max_tokens=5,
             messages=[
-                {"role": "system", "content": "You are a ping probe. Reply with OK."},
-                {"role": "user", "content": "Ping"},
+                {"role": "system", "content": "Réponds uniquement en JSON valide."},
+                {"role": "user", "content": msg}
             ],
         )
-    except Exception as e:
-        raise RuntimeError(f"Échec connexion LLM/deployment='{AZURE_OPENAI_DEPLOYMENT}' api='{AZURE_OPENAI_API_VERSION}': {e}")
-
-
-
-def main():
-    load_dotenv()
-
-    conn_str = require_env("AZURE_STORAGE_CONNECTION_STRING")
-    container = require_env("AZURE_BLOB_CONTAINER")
-    require_env("AZURE_OPENAI_API_KEY")
-    require_env("AZURE_OPENAI_ENDPOINT")
-    require_env("AZURE_OPENAI_DEPLOYMENT")
-
-    args = parse_args()
-    print("➡️  Démarrage pipeline segmentation CV (Azure OpenAI, Blob-only)")
-    print(f"   Container : {container}")
-    print(f"   Prefix    : {args.prefix or '(racine)'}")
-    print(f"   Limit     : {args.limit or '(illimité)'}")
-    print(f"   Force     : {args.force}")
-    print(f"   Output    : {OUTPUT_BLOB_PREFIX}/...")
-
-    try:
-        client = get_azure_client()
-        test_llm_connectivity(client)
-        print("✅ Connexion LLM OK")
+        content = resp.choices[0].message.content
+        json.loads(content)  # doit être JSON
+        print("✅ Connexion LLM OK.")
     except Exception as e:
         print(f"❌ Connexion LLM échouée: {e}")
         sys.exit(1)
 
+# ============== CLI ==============
+def parse_args():
+    ap = argparse.ArgumentParser(description="Pipeline de segmentation CV (Azure Blob + Azure OpenAI)")
+    ap.add_argument("--prefix", type=str, default=INPUT_PREFIX, help="Préfixe Blob des CV (par défaut INPUT_PREFIX env)")
+    ap.add_argument("--limit", type=int, default=None, help="Limiter le nombre de blobs traités")
+    ap.add_argument("--force", action="store_true", help="Forcer re-parse (ignore le cache par hash)")
+    return ap.parse_args()
+
+def main():
+    if not AZURE_STORAGE_CONNECTION_STRING or not BLOB_CONTAINER:
+        print("❌ Manque AZURE_STORAGE_CONNECTION_STRING ou BLOB_CONTAINER.")
+        sys.exit(2)
+
+    args = parse_args()
+    print(f"[RUN] container={BLOB_CONTAINER} prefix='{args.prefix}' limit={args.limit} force={args.force}")
+
+    # Vérifier la connexion LLM avant
+    ping_llm_or_die()
+
     run_pipeline(
-        conn_str=conn_str,
-        container=container,
+        conn_str=AZURE_STORAGE_CONNECTION_STRING,
+        container=BLOB_CONTAINER,
         prefix=args.prefix,
         limit=args.limit,
         force=args.force
     )
-
 
 if __name__ == "__main__":
     main()
