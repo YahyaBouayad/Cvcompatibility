@@ -158,6 +158,7 @@ def build_job_lookup(cc, jobs_prefix: str) -> Dict[str, Dict[str, Any]]:
         lut[job_id] = {
             "job_title": a.get("title") or a.get("internal-name"),
             "job_status": norm_status(a.get("status") or a.get("human-status")),
+            "job_description": (a.get("body_text") or re.sub(r"<[^>]+>", " ", a.get("body") or "") or a.get("content")),
             "job_employment_type": norm_employment_type(a.get("employment-type")),
             "job_employment_level": norm_employment_level(a.get("employment-level")),
             "job_language_code": a.get("language-code"),

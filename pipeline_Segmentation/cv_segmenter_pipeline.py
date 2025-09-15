@@ -56,7 +56,7 @@ AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 # Limites quota (env → override)
 AOAI_RPM = int(os.getenv("AOAI_RPM", "140"))            # ex. 140
 AOAI_TPM = int(os.getenv("AOAI_TPM", "140000"))         # ex. 140_000
-MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "600"))
+MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "2400"))
 
 # Entrée / sortie Blob
 AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
@@ -78,6 +78,8 @@ MAX_DOWNLOAD_CONCURRENCY = int(os.getenv("BLOB_MAX_CONCURRENCY", "4"))
 
 # Résumés (optionnels)
 SAVE_SUMMARIES = os.getenv("SAVE_SUMMARIES", "1") == "1"
+
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 # ============== TOKEN ESTIMATION ==============
 try:
@@ -228,6 +230,48 @@ def simple_clean(text: str) -> str:
     text = re.sub(r"\r\n?", "\n", text)
     return text.strip()
 
+def parse_json_lenient(content: str) -> Optional[dict]:
+    """
+    Tente de parser une réponse JSON même si elle est 'bruitée' :
+    - supprime d'éventuelles fences ```json ... ```
+    - tente json.loads direct
+    - extrait le plus grand bloc {...} si du texte entoure le JSON
+    - essaie une petite réparation (virgules traînantes)
+    Retourne dict si OK, sinon None.
+    """
+    if not content:
+        return None
+
+    s = content.strip()
+    # 1) retirer d'éventuelles fences markdown
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s)
+
+    # 2) tentative directe
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # 3) extraire le plus grand bloc JSON {...}
+    m = _JSON_BLOCK_RE.search(s)
+    if m:
+        candidate = m.group(0)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            # 4) réparation mineure : virgules traînantes avant ] ou }
+            candidate2 = re.sub(r",\s*([\]}])", r"\1", candidate)
+            try:
+                return json.loads(candidate2)
+            except Exception:
+                pass
+
+    # 4 bis) réparation directe sur la chaîne complète
+    s2 = re.sub(r",\s*([\]}])", r"\1", s)
+    try:
+        return json.loads(s2)
+    except Exception:
+        return None
 # ============== AZURE OPENAI CLIENT ==============
 def make_client() -> AzureOpenAI:
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
@@ -271,43 +315,51 @@ def _call_with_retry(fn, max_attempts: int = 5):
 
 # JSON Schema stricte pour la sortie
 CV_JSON_SCHEMA = {
-    "name": "cv_schema",
-    "schema": {
+  "name": "cv_schema",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "has_segmented_cv": {"type": "boolean"},
+      "profile": {
         "type": "object",
         "properties": {
-            "has_segmented_cv": {"type": "boolean"},
-            "profile": {
-                "type": "object",
-                "properties": {
-                    "full_name": {"type": ["string", "null"]},
-                    "title_or_role": {"type": ["string", "null"]},
-                    "summary": {"type": ["string", "null"]},
-                    "location": {"type": ["string", "null"]}
-                }
-            },
-            "experiences": {"type": "array", "items": {
-                "type": "object",
-                "properties": {
-                    "company": {"type": "string"},
-                    "role": {"type": "string"},
-                    "start_date": {"type": "string"},
-                    "end_date": {"type": ["string", "null"]},
-                    "description": {"type": ["string", "null"]}
-                }
-            }},
-            "education": {"type": "array", "items": {
-                "type": "object",
-                "properties": {
-                    "school": {"type": "string"},
-                    "degree": {"type": ["string", "null"]},
-                    "year": {"type": ["string", "null"]}
-                }
-            }},
-            "skills": {"type": "array", "items": {"type": "string"}},
-            "languages": {"type": "array", "items": {"type": "string"}}
-        },
-        "required": ["has_segmented_cv"]
-    }
+          "full_name": {"type": ["string","null"], "maxLength": 200},
+          "title_or_role": {"type": ["string","null"], "maxLength": 200},
+          "summary": {"type": ["string","null"], "maxLength": 600},
+          "location": {"type": ["string","null"], "maxLength": 200}
+        }
+      },
+      "experiences": {
+        "type": "array", "maxItems": 20,
+        "items": {
+          "type": "object",
+          "properties": {
+            "company": {"type": "string", "maxLength": 200},
+            "role": {"type": "string", "maxLength": 200},
+            "start_date": {"type": "string", "maxLength": 100},
+            "end_date": {"type": ["string","null"], "maxLength": 100},
+            "description": {"type": ["string","null"], "maxLength": 700}
+          },
+          "required": ["company","role","start_date"]
+        }
+      },
+      "education": {
+        "type": "array", "maxItems": 20,
+        "items": {
+          "type": "object",
+          "properties": {
+            "school": {"type": "string", "maxLength": 200},
+            "degree": {"type": ["string","null"], "maxLength": 200},
+            "year": {"type": ["string","null"], "maxLength": 100}
+          },
+          "required": ["school"]
+        }
+      },
+      "skills": {"type": "array", "maxItems": 128, "items": {"type": "string","maxLength": 80}},
+      "languages": {"type": "array", "maxItems": 20, "items": {"type": "string","maxLength": 80}}
+    },
+    "required": ["has_segmented_cv"]
+  }
 }
 
 # LLM segmentation
@@ -351,10 +403,33 @@ def llm_segment(text: str) -> dict:
 
     resp = _call_with_retry(_do)
     content = resp.choices[0].message.content
+
+    parsed = parse_json_lenient(content)
+    if parsed is not None:
+        return parsed
+
+# --- Retry optionnel : on élargit le budget si possible ---
     try:
-        return json.loads(content)
+        resp2 = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            temperature=0.0,
+            response_format={"type": "json_schema", "json_schema": CV_JSON_SCHEMA},
+            # on double le budget de sortie, borné
+            max_tokens=min(MAX_OUTPUT_TOKENS * 2, 4096),
+            messages=[
+                {"role": "system", "content": "You are a careful information extraction system. Output STRICT JSON only."},
+                {"role": "user", "content": prompt + "\n\nIMPORTANT: Fournis un JSON COMPLET et VALIDE, sans texte hors JSON."}
+            ],
+        )
+        content2 = resp2.choices[0].message.content
+        parsed2 = parse_json_lenient(content2)
+        if parsed2 is not None:
+            return parsed2
     except Exception:
-        return {"raw_parse_error": content}
+        pass
+
+    # Si on n'a toujours rien de valide
+    return {"raw_parse_error": content}
 
 # ============== HELPERS ID CANDIDAT ==============
 CANDIDATE_ID_PATTERNS = [
