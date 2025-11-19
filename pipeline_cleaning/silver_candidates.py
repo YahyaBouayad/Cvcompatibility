@@ -263,6 +263,10 @@ def load_cv_segmentation(container: ContainerClient, seg_prefix: str, candidate_
     try:
         cv = download_json(container, path)
         parsed = cv.get("parsed") or cv  # supporte 2 variantes
+
+        # Extraire les scores de qualité
+        quality_scores = parsed.get("quality_scores") or {}
+
         return {
             "has_segmented_cv": True,
             "profile": {
@@ -275,6 +279,10 @@ def load_cv_segmentation(container: ContainerClient, seg_prefix: str, candidate_
             "education": parsed.get("education") or [],
             "skills": parsed.get("skills") or parsed.get("tools_and_technologies") or [],
             "languages": parsed.get("languages") or [],
+            "quality_scores": {
+                "spelling_score": quality_scores.get("spelling_score"),
+                "writing_quality_score": quality_scores.get("writing_quality_score")
+            }
         }
     except Exception as e:
         # si lecture impossible, on fallback au flag

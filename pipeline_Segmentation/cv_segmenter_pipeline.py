@@ -140,6 +140,58 @@ class RateLimiter:
 rate_limiter = RateLimiter(AOAI_RPM, AOAI_TPM)
 
 # ============== BLOB HELPERS ==============
+def _deduplicate_candidate_files(names: List[str]) -> List[str]:
+    """
+    Déduplique les fichiers CV par candidat.
+    Pour chaque candidat, garde uniquement le meilleur fichier selon la priorité :
+    1. original.pdf (priorité haute)
+    2. resume.pdf (fallback)
+    3. Tout autre fichier
+    """
+    from collections import defaultdict
+
+    # Grouper par candidat_id
+    candidates = defaultdict(list)
+
+    for name in names:
+        # Extraire l'ID candidat du chemin
+        cand_id = candidate_id_from_blob(name)
+        if cand_id:
+            candidates[cand_id].append(name)
+        else:
+            # Si on ne peut pas extraire l'ID, garder le fichier
+            candidates[name].append(name)
+
+    # Pour chaque candidat, sélectionner le meilleur fichier
+    selected = []
+    for cand_id, files in candidates.items():
+        if len(files) == 1:
+            selected.append(files[0])
+            continue
+
+        # Priorité : original.pdf > resume.pdf > autres
+        original = None
+        resume = None
+        other = None
+
+        for f in files:
+            basename = f.rsplit("/", 1)[-1].lower()
+            if basename == "original.pdf":
+                original = f
+            elif basename == "resume.pdf":
+                resume = f
+            elif not other:
+                other = f
+
+        # Sélectionner selon la priorité
+        chosen = original or resume or other
+        selected.append(chosen)
+
+        if len(files) > 1:
+            print(f"   [DEDUP] Candidat {cand_id}: {len(files)} fichiers → choisi '{chosen.rsplit('/', 1)[-1]}'")
+
+    return selected
+
 def list_blobs_flat(container_client, prefix: str = "", limit: Optional[int] = None) -> List[str]:
     names = []
     for b in container_client.list_blobs(name_starts_with=prefix or ""):
@@ -154,7 +206,11 @@ def list_blobs_flat(container_client, prefix: str = "", limit: Optional[int] = N
         names.append(name)
         if limit and len(names) >= limit:
             break
-    print(f"   → {len(names)} blobs trouvés sous '{prefix}' (uploads_only={INCLUDE_UPLOADS_ONLY})")
+
+    # Dédupliquer les fichiers par candidat
+    names = _deduplicate_candidate_files(names)
+
+    print(f"   → {len(names)} fichiers CV uniques après déduplication")
     for n in names[:5]:
         print(f"     - {n}")
     if not names and INCLUDE_UPLOADS_ONLY:
@@ -180,21 +236,38 @@ def is_pdf_bytes(data: bytes) -> bool:
     return data[:5] == b"%PDF-"
 
 def extract_text_from_pdf_bytes(data: bytes) -> str:
+    # Try PyMuPDF first (faster)
     if _has_pymupdf:
         try:
             doc = fitz.open(stream=data, filetype="pdf")
-            return "\n".join(page.get_text() or "" for page in doc)
+            text = "\n".join(page.get_text() or "" for page in doc)
+            if text.strip():  # Si on a du texte, retourner
+                return text
         except Exception:
-            pass
-    # fallback pypdf via fichier temporaire
+            pass  # Pas de print, on essaie pypdf en silence
+
+    # Fallback pypdf via fichier temporaire
     if _has_pypdf:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-            tmp.write(data); tmp.flush()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(data)
+                tmp.flush()
+                tmp_path = tmp.name
+
+            reader = PdfReader(tmp_path)
+            text = "\n".join([p.extract_text() or "" for p in reader.pages])
+
+            # Nettoyer le fichier temporaire
             try:
-                reader = PdfReader(tmp.name)
-                return "\n".join([p.extract_text() or "" for p in reader.pages])
+                os.unlink(tmp_path)
             except Exception:
                 pass
+
+            if text.strip():
+                return text
+        except Exception:
+            pass  # Pas de print, on retourne juste vide
+
     return ""
 
 def extract_text_from_docx_bytes(data: bytes) -> str:
@@ -307,7 +380,9 @@ def _call_with_retry(fn, max_attempts: int = 5):
                 continue
             if k < max_attempts:
                 back = 2.0 * k
-                print(f"   ⏳ Erreur {type(e).__name__}: retry dans {back:.1f}s (tentative {k}/{max_attempts})")
+                # Encoder le nom de l'exception de manière sûre pour éviter UnicodeEncodeError
+                error_name = type(e).__name__.encode('ascii', 'replace').decode('ascii')
+                print(f"   ⏳ Erreur {error_name}: retry dans {back:.1f}s (tentative {k}/{max_attempts})")
                 time.sleep(back)
             else:
                 raise
@@ -356,9 +431,27 @@ CV_JSON_SCHEMA = {
         }
       },
       "skills": {"type": "array", "maxItems": 128, "items": {"type": "string","maxLength": 80}},
-      "languages": {"type": "array", "maxItems": 20, "items": {"type": "string","maxLength": 80}}
+      "languages": {"type": "array", "maxItems": 20, "items": {"type": "string","maxLength": 80}},
+      "quality_scores": {
+        "type": "object",
+        "properties": {
+          "spelling_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Score d'orthographe sur 10 (0=nombreuses fautes, 10=parfait)"
+          },
+          "writing_quality_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Score de qualité rédactionnelle sur 10 (0=très faible, 10=excellent)"
+          }
+        },
+        "required": ["spelling_score", "writing_quality_score"]
+      }
     },
-    "required": ["has_segmented_cv"]
+    "required": ["has_segmented_cv", "quality_scores"]
   }
 }
 
@@ -381,6 +474,19 @@ def llm_segment(text: str) -> dict:
         "Tu extrais un CV en JSON STRICT selon le schéma fourni. "
         "Si une section est absente dans le texte, renvoie un champ vide ([], {}). "
         "N'invente pas d'informations.\n\n"
+        "IMPORTANT: Tu dois également évaluer la qualité du CV sur deux critères (notes sur 10):\n"
+        "1. spelling_score (orthographe): Évalue les fautes d'orthographe, grammaire, ponctuation.\n"
+        "   - 9-10: Parfait, aucune faute\n"
+        "   - 7-8: Très bon, quelques fautes mineures\n"
+        "   - 5-6: Correct, plusieurs fautes mais lisible\n"
+        "   - 3-4: Nombreuses fautes qui gênent la lecture\n"
+        "   - 0-2: Très nombreuses fautes, presque illisible\n\n"
+        "2. writing_quality_score (qualité rédactionnelle): Évalue la structure, clarté, concision, professionnalisme.\n"
+        "   - 9-10: Excellent, très professionnel, bien structuré, clair et concis\n"
+        "   - 7-8: Bon, professionnel, bien organisé\n"
+        "   - 5-6: Correct, structure acceptable mais peut être amélioré\n"
+        "   - 3-4: Faible, désorganisé, manque de clarté\n"
+        "   - 0-2: Très faible, confusion, aucune structure\n\n"
         "=== TEXTE CV ===\n"
         f"{text_cut}"
     )
@@ -418,7 +524,7 @@ def llm_segment(text: str) -> dict:
             max_tokens=min(MAX_OUTPUT_TOKENS * 2, 4096),
             messages=[
                 {"role": "system", "content": "You are a careful information extraction system. Output STRICT JSON only."},
-                {"role": "user", "content": prompt + "\n\nIMPORTANT: Fournis un JSON COMPLET et VALIDE, sans texte hors JSON."}
+                {"role": "user", "content": prompt + "\n\nIMPORTANT: Fournis un JSON COMPLET et VALIDE, sans texte hors JSON. N'oublie pas les scores de qualité (spelling_score et writing_quality_score)."}
             ],
         )
         content2 = resp2.choices[0].message.content
@@ -466,9 +572,25 @@ def text_hash_in_blob(container_client, cand_id: str) -> str:
     except Exception:
         return ""
 
-# ============== TRAITEMENT D’UN BLOB ==============
+# ============== TRAITEMENT D'UN BLOB ==============
+def check_if_already_processed(container_client, cand_id: str, force: bool = False) -> bool:
+    """Vérifie si un candidat a déjà été traité (JSON existe)."""
+    if force:
+        return False
+    try:
+        dest_json = f"{OUTPUT_BLOB_PREFIX}/json/{cand_id}.json"
+        b = container_client.get_blob_client(dest_json)
+        return b.exists()
+    except Exception:
+        return False
+
 def process_one_blob(container_client, blob_name: str, force: bool = False) -> Dict[str, Any]:
     cand_id = candidate_id_from_blob(blob_name) or "unknown"
+
+    # Vérification rapide : si le JSON existe déjà et force=False, skip immédiatement
+    if check_if_already_processed(container_client, cand_id, force):
+        return {"candidate_id": cand_id, "blob_name": blob_name, "skipped": True, "reason": "already_exists"}
+
     # 1) download
     raw = download_blob_to_bytes(container_client, blob_name)
     # 2) extract & clean
@@ -477,7 +599,7 @@ def process_one_blob(container_client, blob_name: str, force: bool = False) -> D
     if not text:
         raise RuntimeError("Texte vide après extraction.")
 
-    # 2b) cache par hash
+    # 2b) cache par hash (vérification supplémentaire si le fichier existe mais on veut check le hash)
     th = sha1(text)
     if not force:
         prev = text_hash_in_blob(container_client, cand_id)
@@ -510,6 +632,32 @@ def run_pipeline(conn_str: str, container: str, prefix: str, limit: Optional[int
     blobs = list_blobs_flat(cont, prefix=prefix, limit=limit)
     print(f"🔎 {len(blobs)} fichiers CV trouvés sous '{container}/{prefix}'")
 
+    # Pré-filtrage : vérifier quels CV sont déjà traités
+    if not force:
+        print("\n📊 Analyse des CV déjà traités...")
+        already_processed = []
+        to_process = []
+
+        for blob in blobs:
+            cand_id = candidate_id_from_blob(blob) or "unknown"
+            if check_if_already_processed(cont, cand_id, force):
+                already_processed.append(blob)
+            else:
+                to_process.append(blob)
+
+        print(f"   ✅ Déjà traités: {len(already_processed)}")
+        print(f"   🆕 À traiter: {len(to_process)}")
+
+        if len(to_process) == 0:
+            print("\n✨ Tous les CV sont déjà traités ! Rien à faire.")
+            return
+
+        # Utiliser seulement les CV à traiter
+        blobs = to_process
+        print(f"\n🚀 Lancement du traitement de {len(blobs)} CV...")
+    else:
+        print(f"\n🚀 Mode FORCE activé: retraitement de {len(blobs)} CV...")
+
     results: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
 
@@ -525,7 +673,10 @@ def run_pipeline(conn_str: str, container: str, prefix: str, limit: Optional[int
                 else:
                     print(f"   ✅  {res['candidate_id']} → {res['json_blob']}")
             except Exception as e:
-                print(f"   ⚠️  Erreur sur {b}: {e}")
+                # Éviter UnicodeEncodeError : encoder en ASCII de manière sûre
+                blob_safe = b.encode('ascii', 'replace').decode('ascii') if isinstance(b, str) else str(b)
+                error_safe = str(e).encode('ascii', 'replace').decode('ascii')[:200]
+                print(f"   ⚠️  Erreur sur {blob_safe}: {error_safe}")
                 err = {"blob_name": b, "error": str(e), "ts": datetime.utcnow().isoformat()}
                 errors.append(err)
                 try:
@@ -587,15 +738,23 @@ def ping_llm_or_die():
             model=AZURE_OPENAI_DEPLOYMENT,
             temperature=0.0,
             response_format={"type": "json_object"},
-            max_tokens=5,
+            max_tokens=50,  # Augmenté pour permettre un JSON complet
             messages=[
                 {"role": "system", "content": "Réponds uniquement en JSON valide."},
                 {"role": "user", "content": msg}
             ],
         )
         content = resp.choices[0].message.content
-        json.loads(content)  # doit être JSON
-        print("✅ Connexion LLM OK.")
+        if not content or not content.strip():
+            raise ValueError("Réponse vide de l'API")
+        # Nettoyer la réponse avant parsing
+        content_cleaned = content.strip()
+        parsed = json.loads(content_cleaned)
+        print(f"✅ Connexion LLM OK. Réponse: {parsed}")
+    except json.JSONDecodeError as e:
+        print(f"❌ Connexion LLM échouée - Erreur JSON: {e}")
+        print(f"   Contenu reçu: '{content if 'content' in locals() else 'N/A'}'")
+        sys.exit(1)
     except Exception as e:
         print(f"❌ Connexion LLM échouée: {e}")
         sys.exit(1)

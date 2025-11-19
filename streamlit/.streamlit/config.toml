@@ -1,0 +1,20 @@
+[theme]
+primaryColor = "#5525E4"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#1E1047"
+borderColor ="#DDD3FD"
+infoColor ="#2c1a68ff"
+font = "Open Sans:https://fonts.googleapis.com/css2?family=Open+Sans&display=swap"
+
+[client]
+showErrorDetails = true
+toolbarMode = "viewer"
+
+[logger]
+level = "info"
+
+[server]
+port = 8501
+headless = true
+runOnSave = true

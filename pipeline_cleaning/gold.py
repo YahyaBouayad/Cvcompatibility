@@ -276,6 +276,72 @@ def to_bool_any(v: Any) -> Optional[bool]:
         return False
     return None
 
+# ── Helpers timezone & dates ───────────────────────────────────────────────────
+def _to_utc(ts):
+    import pandas as pd
+    if ts is None:
+        return None
+    if not isinstance(ts, pd.Timestamp):
+        try:
+            ts = pd.to_datetime(ts, errors="coerce", utc=True)
+        except Exception:
+            return None
+    # si naïf → localize UTC ; si aware → convert UTC
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+def _years_between(s, e) -> float:
+    import pandas as pd
+    s = _to_utc(s)
+    e = _to_utc(e) or pd.Timestamp.now(tz="UTC")
+    if s is None or e <= s:
+        return 0.0
+    return float((e - s).total_seconds() / (365.25 * 24 * 3600))
+
+def _merge_intervals(intervals):
+    """ intervals: list[tuple[pd.Timestamp, pd.Timestamp]] (UTC)
+        Retourne une liste fusionnée sans chevauchement. """
+    if not intervals:
+        return []
+    intervals = sorted(intervals, key=lambda x: x[0])
+    merged = []
+    cur_s, cur_e = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= cur_e:
+            if e > cur_e:
+                cur_e = e
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    merged.append((cur_s, cur_e))
+    return merged
+
+def compute_seniority_union_years(experiences, ref_end=None) -> float:
+    """Calcule la séniorité comme la mesure de l'UNION des périodes (anti-double-compte).
+       - ref_end: borne haute pour les postes 'actuels' (par ex. application_created_at)."""
+    import numpy as np
+
+    intervals = []
+    for e in (experiences or []):
+        start = e.get("start_date") or e.get("from") or e.get("start")
+        end   = e.get("end_date")   or e.get("to")   or e.get("end")
+        s = parse_date_robust(start) if start else None
+        t = parse_date_robust(end)   if end   else None
+        if t is None:
+            t = ref_end or pd.Timestamp.now(tz="UTC")
+        s = _to_utc(s); t = _to_utc(t)
+        if s is None or t is None or t <= s:
+            continue
+        # Nettoyage par période
+        dur_y = _years_between(s, t)
+        if dur_y < (1/12):   # < 1 mois → bruit
+            continue
+        if dur_y > 15:       # > 15 ans une SEULE période → probablement bruit/parsing
+            continue
+        intervals.append((s, t))
+
+    merged = _merge_intervals(intervals)
+    total_years = sum(_years_between(s, t) for s, t in merged)
+    return float(np.clip(total_years, 0.0, 50.0))
 
 # ============== Activités (silver applications) ==============
 
@@ -338,6 +404,22 @@ def build_activity_features(row: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(summary.get("interviews_texts"), list):
             interview_lines = [normalize_str(x) for x in summary["interviews_texts"] if normalize_str(x)]
 
+        try:
+            stage_transitions = int(summary.get("stage_transitions_count") or 0)
+        except Exception:
+            stage_transitions = 0
+        progressed_in_pipeline = stage_transitions > 1
+
+        finally_rejected = bool(
+            row.get("rejected_at")  # déjà normalisé plus haut dans silver
+            or str(row.get("decision")).lower() == "rejected"
+        )
+
+        # 3. notre flag final
+        had_positive_stage_but_extracted_late = bool(
+            progressed_in_pipeline and finally_rejected
+        )
+
         return {
             "act_n_total": int(n_notes + n_interviews + n_messages + n_assess),
             "act_n_messages": int(n_messages),
@@ -350,6 +432,8 @@ def build_activity_features(row: Dict[str, Any]) -> Dict[str, Any]:
             "act_days_in_process": days_in_process,
             "act_recent_activity_7d": bool(recent_7d) if recent_7d is not None else None,
             "act_last_activity_type": last_type,
+            "act_had_interview": bool(n_interviews > 0),
+            "y_proxy_positive": (True if (n_interviews > 0 or n_assess > 0 or n_messages > 0) else None),
             "text_messages_all": "\n\n---\n\n".join(msg_lines) if msg_lines else None,
             "text_interview_notes_all": "\n\n---\n\n".join(interview_lines) if interview_lines else None,
             "text_assessments_all": "\n\n---\n\n".join(assess_lines) if assess_lines else None,
@@ -357,6 +441,7 @@ def build_activity_features(row: Dict[str, Any]) -> Dict[str, Any]:
             "text_notes_all": "\n\n---\n\n".join(notes_lines) if notes_lines else None,
             "y_proxy_positive": True if n_interviews > 0 else False,
             "act_had_interview": True if n_interviews > 0 else False,
+            "had_positive_stage_but_extracted_late": had_positive_stage_but_extracted_late,
         }
 
     # Fallback: si pas de summary, renvoyer une structure vide pour ne pas bloquer
@@ -379,6 +464,7 @@ def build_activity_features(row: Dict[str, Any]) -> Dict[str, Any]:
         "text_notes_all": None,
         "y_proxy_positive": None,
         "act_had_interview": None,
+        "had_positive_stage_but_extracted_late": None,
     }
 
 
@@ -458,6 +544,9 @@ def explode_cv_text_views(seg: Dict[str, Any]) -> Tuple[
 ]:
     seg = ensure_dict(seg)
     experiences = _normalize_list_of_dicts_or_str(seg.get("experiences") or [])
+    seniority_years = compute_seniority_union_years(experiences, ref_end=None)
+
+
     education = _normalize_list_of_dicts_or_str(seg.get("education") or [])
     skills = seg.get("skills") or []
     languages = seg.get("languages") or []
@@ -560,7 +649,7 @@ def explode_cv_text_views(seg: Dict[str, Any]) -> Tuple[
 
     return (
         text_exp, text_skills, text_full, (clean_skills or None), langs, summary, cv_lang,
-        p_title, location_to_str(p_loc_raw), last_loc, last_title, last_company
+        p_title, location_to_str(p_loc_raw), last_loc, last_title, last_company,seniority_years
     )
 
 def derive_has_segments(seg: Dict[str, Any]) -> bool:
@@ -602,7 +691,14 @@ def build_cv_from_candidates_row(row: Dict[str, Any]) -> Dict[str, Any]:
         seg = {}
 
     (text_exp, text_skills, text_full, skills_list, langs_list, summary, cv_lang,
-     p_title, p_loc, last_loc, last_title, last_company) = explode_cv_text_views(seg)
+     p_title, p_loc, last_loc, last_title, last_company,seniority_years) = explode_cv_text_views(seg)
+    
+    ref_end = row.get("application_created_at") or row.get("job_created_at")
+    if isinstance(ref_end, str):
+        ref_end = parse_date_robust(ref_end)
+    ref_end = _to_utc(ref_end)
+    
+
     cv_has = derive_has_segments(seg)
     has_segments_top = bool(row.get("has_segments") is True)
     synth_summary = summary
@@ -610,6 +706,12 @@ def build_cv_from_candidates_row(row: Dict[str, Any]) -> Dict[str, Any]:
         parts = [p_title, last_title, last_company]
         parts = [p for p in parts if p]
         synth_summary = " — ".join(parts) if parts else None
+
+    # Extraire les scores de qualité depuis quality_scores
+    quality_scores = seg.get("quality_scores") or {}
+    spelling_score = quality_scores.get("spelling_score")
+    writing_quality_score = quality_scores.get("writing_quality_score")
+
     return {
         "cv_lang": cv_lang,
         "cv_has_segments": True if (has_segments_top or cv_has) else False,
@@ -622,6 +724,8 @@ def build_cv_from_candidates_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "cv_text_hash": row.get("cv_text_hash") or row.get("text_hash") or None,
         "cv_segmenter_version": row.get("segmenter_version") or None,
         "cv_llm_deployment": row.get("llm_deployment") or None,
+        "cv_spelling_score": spelling_score,
+        "cv_writing_quality_score": writing_quality_score,
         "__cv_profile_title": p_title,
         "__cv_profile_location": p_loc,
         "__cv_languages": langs_list,
@@ -629,7 +733,253 @@ def build_cv_from_candidates_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "__cv_last_location": last_loc,
         "__cv_last_title": last_title,
         "__cv_last_company": last_company,
+        "__cv_seniority_years": seniority_years,
+
+
+
     }
+# --- NEW: collect recruiter messages & answers into text blocks (robust) ---
+
+_MESSAGE_COL_CANDIDATES = [
+    # listes de messages (chaque item string/dict)
+    "recruiter_messages", "recruiter_message_texts", "messages", "message_texts",
+    "communications", "notes", "comments", "threads", "conversation",
+    # parfois enrichi
+    "app_messages", "application_messages"
+]
+
+_ANSWER_LIST_COL_CANDIDATES = [
+    # listes d'answers (chaque item dict)
+    "answers", "application_answers", "screening_answers",
+    "custom_answers", "answers_list"
+]
+
+_ANSWER_MAP_COL_CANDIDATES = [
+    # dicts id->answer ou code->value
+    "answers_map", "answers_by_id", "answers_dict", "answers_json"
+]
+
+# Silver spécifiques que l'on veut exploiter
+_QA_SUMMARY_COL = "qa_summary"
+_ACTIVITIES_SUMMARY_COL = "activities_summary"
+
+_TEXT_KEYS = ["text","body","message","content","note","comment","value","answer","string","label","title","description","html"]
+
+# en tête de fichier, assure-toi d'avoir déjà:  import re
+def _html_to_text_like(s: str) -> str:
+    """Light HTML → text fallback (utilise bs4 si dispo, sinon regex)."""
+    if not isinstance(s, str) or not s.strip():
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(s, "html.parser")
+        t = soup.get_text(separator="\n")
+    except Exception:
+        # si bs4 indispo ou parse KO, on garde tel quel (on nettoiera juste après)
+        t = s
+
+    # nettoyage uniforme (que bs4 ait marché ou non)
+    t = re.sub(r"<br\s*/?>", "\n", t, flags=re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n\s*\n\s*", "\n\n", t).strip()
+    return t
+
+
+def _ensure_list(x):
+    if x is None: return []
+    if isinstance(x, list): return x
+    # parfois concat string JSON
+    if isinstance(x, str):
+        xs = x.strip()
+        if xs.startswith("["):
+            import json
+            try:
+                arr = json.loads(xs)
+                return arr if isinstance(arr, list) else [xs]
+            except Exception:
+                return [xs]
+        # chaîne “;” séparée
+        if ";" in xs:
+            return [t.strip() for t in xs.split(";") if t.strip()]
+        return [xs] if xs else []
+    return [x]
+
+def _extract_text_from_obj(o) -> list[str]:
+    """Retourne une liste de textes depuis un objet libre (str/dict/list)."""
+    out = []
+    if o is None:
+        return out
+    if isinstance(o, str):
+        txt = _html_to_text_like(o)
+        if txt: out.append(txt)
+        return out
+    if isinstance(o, dict):
+        # cherche champs textuels classiques
+        for k in _TEXT_KEYS:
+            v = o.get(k)
+            if isinstance(v, str) and v.strip():
+                txt = _html_to_text_like(v)
+                if txt: out.append(txt)
+        # parfois nested sous attributes / data
+        for nest in ("attributes","data"):
+            if isinstance(o.get(nest), dict):
+                for k in _TEXT_KEYS:
+                    v = o[nest].get(k)
+                    if isinstance(v, str) and v.strip():
+                        txt = _html_to_text_like(v)
+                        if txt: out.append(txt)
+        return out
+    if isinstance(o, (list, tuple)):
+        for it in o:
+            out.extend(_extract_text_from_obj(it))
+        return out
+    # fallback
+    s = str(o).strip()
+    if s: out.append(s)
+    return out
+
+def _looks_like_candidate(o) -> bool:
+    """Heuristique: True si le message semble venir du candidat (on l'exclut)."""
+    if not isinstance(o, dict):
+        return False
+    probe = " ".join([str(o.get(k,"")) for k in ("sender","from","author","user","role","direction")]).lower()
+    if any(t in probe for t in ["candidate","applicant","candidat","applicante","incoming"]):
+        return True
+    return False
+
+def _is_recruiter_message(o) -> bool:
+    """Heuristique: True si message RH plausible (vs candidat)."""
+    if not isinstance(o, dict):
+        # si on n'a pas l'info, on garde (meilleur rappel)
+        return True
+    probe = " ".join([str(o.get(k,"")) for k in ("sender","from","author","user","role","direction","type")]).lower()
+    if any(t in probe for t in ["recruiter","employee","hr","staff","techtalent","outgoing"]):
+        return True
+    if _looks_like_candidate(o):
+        return False
+    return True
+
+# --------- NEW: Silver-specific extractors (qa_summary + last_note_excerpt) ---------
+
+def _as_jsonlike(x):
+    if isinstance(x, (dict, list)):
+        return x
+    if isinstance(x, str) and x.strip().startswith(("{","[")):
+        try:
+            import json
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+def _extract_qa_summary_texts(row) -> list[str]:
+    """
+    Silver: qa_summary.raw est une liste d'objets avec au moins {answer_id, text, ...}.
+    On récupère le champ 'text' de chaque item, même si question_title est null.
+    """
+    out = []
+    qs = row.get(_QA_SUMMARY_COL)
+    if qs is None:
+        return out
+    js = _as_jsonlike(qs)
+    if isinstance(js, dict):
+        raw = js.get("raw")
+        raw = _ensure_list(raw) if raw is not None else []
+        for it in raw:
+            if isinstance(it, dict):
+                txt = it.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    out.append(_html_to_text_like(txt))
+            else:
+                out.extend(_extract_text_from_obj(it))
+    elif isinstance(js, list):
+        for it in js:
+            if isinstance(it, dict):
+                txt = it.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    out.append(_html_to_text_like(txt))
+            else:
+                out.extend(_extract_text_from_obj(it))
+    return out
+
+def _extract_activities_last_note(row) -> list[str]:
+    """
+    Silver: activities_summary.last_note_excerpt peut contenir un extrait utile (parfois vide).
+    """
+    out = []
+    act = row.get(_ACTIVITIES_SUMMARY_COL)
+    if act is None:
+        return out
+    js = _as_jsonlike(act)
+    if isinstance(js, dict):
+        note = js.get("last_note_excerpt")
+        if isinstance(note, str) and note.strip():
+            out.append(_html_to_text_like(note))
+    return out
+
+# ---------------------- main collector ----------------------
+
+def build_conv_blocks_from_row(row) -> list[str]:
+    """Agrège messages RH + answers en une liste de blocs texte (dédupliqués)."""
+    blocks: list[str] = []
+
+    # 1) Messages RH génériques (si colonnes existent)
+    for col in _MESSAGE_COL_CANDIDATES:
+        if col in row and row[col] is not None:
+            data = row[col]
+            items = _ensure_list(data)
+            for it in items:
+                if isinstance(it, dict) and not _is_recruiter_message(it):
+                    continue
+                blocks.extend(_extract_text_from_obj(it))
+
+    # 2) Answers génériques (listes d'objets)
+    for col in _ANSWER_LIST_COL_CANDIDATES:
+        if col in row and row[col] is not None:
+            items = _ensure_list(row[col])
+            for it in items:
+                blocks.extend(_extract_text_from_obj(it))
+
+    # 3) Answers génériques (maps id->obj/value)
+    for col in _ANSWER_MAP_COL_CANDIDATES:
+        if col in row and row[col] is not None:
+            mp = row[col]
+            if isinstance(mp, dict):
+                for _, it in mp.items():
+                    blocks.extend(_extract_text_from_obj(it))
+            elif isinstance(mp, str) and mp.strip().startswith("{"):
+                import json
+                try:
+                    d = json.loads(mp)
+                    if isinstance(d, dict):
+                        for _, it in d.items():
+                            blocks.extend(_extract_text_from_obj(it))
+                except Exception:
+                    pass
+
+    # 4) --- NEW: Silver spécifiques ---
+    #    - qa_summary.raw[].text (réponses renseignées par RH)
+    blocks.extend(_extract_qa_summary_texts(row))
+    #    - activities_summary.last_note_excerpt (extrait de la dernière note RH)
+    blocks.extend(_extract_activities_last_note(row))
+
+    # Nettoyage: trim + drop vides + dédoublonner en gardant l’ordre
+    cleaned = []
+    seen = set()
+    for b in blocks:
+        bb = str(b).strip()
+        if not bb:
+            continue
+        if len(bb) > 4000:
+            bb = bb[:4000] + "…"
+        key = bb.lower()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(bb)
+
+    return cleaned
+
 
 
 # ---- Robust key coalescing for joins ----
@@ -781,6 +1131,14 @@ def construct_gold(
 
     # -------- Job --------
     out["job_title"] = pick(base, ["title_job", "job_title", "title"])
+    
+    out["job_llm_segments"] = pick(base, [
+    "job_llm_segments",        # nom qu'on voit dans le fichier jobs actuel ✅
+    "llm_segments_job",        # au cas où tu changes le nom dans une prochaine version
+    "llm_segments",            # fallback générique
+    "job_llm_segmented",       # autre naming qu'on rencontre souvent
+    "job_llm_blocks",          # fallback chunks
+])
 
     # Description (scan + html)
     desc_candidates = [
@@ -801,6 +1159,27 @@ def construct_gold(
         out["job_description_text"] = html_ser.map(html_to_text)
     else:
         out["job_description_text"] = None
+
+    out["job_requirements_text"] = pick(base, [
+        "job_requirements_text_llm", "requirements_text_job"
+    ])
+
+    out["job_responsibilities_text"] = pick(base, [
+        "job_responsibilities_text_llm"
+    ])
+
+    out["job_required_skills_must"] = pick(base, [
+        "required_skills_must_llm"
+    ])
+
+    out["job_required_skills_plus"] = pick(base, [
+        "required_skills_plus_llm"
+    ])
+
+    out["job_languages_required"] = pick(base, [
+        "required_languages_llm"
+    ])
+
 
     # Department
     dept_candidates = ["department_job","job_department","department","department_name","dept_job","dept","team","practice"]
@@ -861,14 +1240,15 @@ def construct_gold(
     out["cand_current_title"] = pick(base, ["current_title","headline","candidate_title"]) \
         .combine_first(base.get("__cv_profile_title", pd.Series([None]*len(base)))) \
         .combine_first(base.get("__cv_last_title", pd.Series([None]*len(base))))
-    out["cand_seniority"] = pick(base, ["seniority"])
+    out["cand_seniority"] = pick(base, ["seniority", "__cv_seniority_years"]).astype(float)
     out["cand_langs"] = pick(base, ["languages","cand_langs"]).combine_first(base.get("__cv_languages", pd.Series([None]*len(base))))
     out["cand_skills"] = pick(base, ["skills","cand_skills"]).combine_first(base.get("__cv_skills", pd.Series([None]*len(base))))
 
     # -------- CV (vues & méta) --------
     for c in ["cv_lang","cv_has_segments","cv_skills","cv_languages","cv_summary",
               "text_cv_experience","text_cv_skills","text_cv_full",
-              "cv_text_hash","cv_segmenter_version","cv_llm_deployment"]:
+              "cv_text_hash","cv_segmenter_version","cv_llm_deployment",
+              "cv_spelling_score","cv_writing_quality_score"]:
         out[c] = base[c] if c in base.columns else None
 
     # -------- Activités --------
@@ -877,7 +1257,7 @@ def construct_gold(
         "act_first_activity_at","act_last_activity_at","act_days_to_first_reply","act_days_in_process",
         "act_recent_activity_7d","act_last_activity_type",
         "text_messages_all","text_interview_notes_all","text_assessments_all","text_last_activities_30d","text_notes_all",
-        "act_had_interview","y_proxy_positive"
+        "act_had_interview","y_proxy_positive","had_positive_stage_but_extracted_late"
     ]:
         out[c] = base[c] if c in base.columns else None
 
@@ -930,6 +1310,23 @@ def construct_gold(
 
     # Dédoublonnage
     out = out.drop_duplicates(subset=["application_id"], keep="last")
+
+    # --- Conversation blocks (messages RH + answers) ----------------------------
+    # On préfère "base" (jointure riche) car il contient qa_summary / activities_summary
+    try:
+        # aligne base sur l'index de out pour éviter les décalages
+        src = base.reindex(out.index)
+    except Exception:
+        # fallback: si "base" n'est pas dispo ici, on travaille sur out
+        src = out
+
+    # produit une liste de blocs de texte par ligne
+    conv_blocks = src.apply(lambda r: build_conv_blocks_from_row(r), axis=1)
+
+    # colonnes finales dans le GOLD
+    out["conv_text_blocks"] = conv_blocks
+    out["conv_n_blocks"] = conv_blocks.map(lambda x: len(x) if isinstance(x, list) else 0)
+
     return out
 
 
@@ -939,7 +1336,7 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Build GOLD table from silvers (no external segmentation file).")
-    parser.add_argument("--only-has-segments", action="store_true", default=True,
+    parser.add_argument("--only-has-segments", action=argparse.BooleanOptionalAction, default=True,
                         help="Garder uniquement les candidatures avec has_segments=True.")
     parser.add_argument("--apps-prefix", default=os.getenv("SILVER_APPLICATIONS_PREFIX", "silver/job-applications/"))
     parser.add_argument("--cands-prefix", default=os.getenv("SILVER_CANDIDATES_PREFIX", "silver/candidates_unified/"))

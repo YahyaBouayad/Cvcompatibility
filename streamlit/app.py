@@ -1,343 +1,641 @@
-import json
-from typing import Any, Dict, List, Optional, Tuple
+# app.py — Dashboard GOLD + Scoring (Streamlit)
+from __future__ import annotations
 
+import json
+import os
+from datetime import datetime, date
+from typing import Optional, Iterable, Any
+
+import numpy as np
 import pandas as pd
 import streamlit as st
-from azure.storage.blob import BlobServiceClient
+import requests
+import plotly.express as px
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="CV Compatibility — Jobs publics", page_icon="🧩", layout="wide")
-st.title("🧩 CV Compatibility — Jobs publics (POC Streamlit)")
-st.caption("Lecture directe des fichiers *silver* (JSONL) depuis Azure Blob Storage, sans appel API Teamtailor.")
+# Azure Blob
+try:
+    from azure.storage.blob import BlobServiceClient  # type: ignore
+except Exception:
+    BlobServiceClient = None
 
-# === FIX CSS: forcer l'affichage horizontal + ellipse des labels de boutons ===
-st.markdown("""
-<style>
-/* Tous les boutons Streamlit */
-.stButton > button {
-  white-space: nowrap !important;
-  overflow: hidden !important;
-  text-overflow: ellipsis !important;
-  min-width: 160px;               /* largeur mini pour éviter les retours à la ligne */
-  height: 44px;                    /* hauteur homogène */
-  border-radius: 14px;
+st.set_page_config(page_title="CV Compatibility — Dashboard GOLD", page_icon="✅", layout="wide")
+
+# Configuration API
+API_URL = os.getenv("API_URL", "http://localhost:8000")
+
+ENV_AZ = {
+    "connection_string": "DefaultEndpointsProtocol=https;AccountName=absaifabrik;AccountKey=dHnt6TqjK6GYHvEjLTKenFdRHitSCByxcqenpCAvP/+GkY6XjHk7+BMfSpVuhbSpUi/5EfGq61CR+AStw0NiCA==;EndpointSuffix=core.windows.net",
+    "account_url": os.getenv("AZURE_BLOB_ACCOUNT_URL"),
+    "sas_token": os.getenv("AZURE_BLOB_SAS_TOKEN"),
+    "account_key": os.getenv("AZURE_STORAGE_ACCOUNT_KEY"),
+    "container": os.getenv("AZURE_BLOB_CONTAINER") or "cvcompat",
+    "gold_blob": os.getenv("GOLD_BLOB_PATH") or "gold/applications_gold_latest.jsonl",
 }
-/* Boutons de pagination ◀ ▶ */
-div[data-testid="stHorizontalBlock"] .stButton > button {
-  min-width: 64px;
+
+# secrets > env > défauts
+CFG = {
+    "connection_string":  ENV_AZ["connection_string"],
+    "account_url": ENV_AZ["account_url"],
+    "sas_token":  ENV_AZ["sas_token"],
+    "account_key":  ENV_AZ["account_key"],
+    "container":  ENV_AZ["container"],
+    "gold_blob":  ENV_AZ["gold_blob"],
 }
-</style>
-""", unsafe_allow_html=True)
 
-# =========================
-#  Helpers & normalisation (identiques à ta version précédente)
-# =========================
-@st.cache_data(show_spinner=False, ttl=300)
-def get_blob_bytes(connection_string: str, container: str, blob_path: str) -> bytes:
-    bsc = BlobServiceClient.from_connection_string(connection_string)
-    return bsc.get_container_client(container).get_blob_client(blob_path).download_blob().readall()
 
-def _coerce_json(obj: Any) -> List[Dict[str, Any]]:
-    if isinstance(obj, list): return obj
-    if isinstance(obj, dict): return [obj]
-    text = obj.decode("utf-8", errors="ignore") if isinstance(obj, (bytes, bytearray)) else (obj or "")
-    if not isinstance(text, str): return []
+DATE_COLS = ["application_created_at", "rejected_at", "hired_at", "meta_processing_ts"]
+
+# --- Utils ---
+def _get_blob_service_client() -> "BlobServiceClient":
+    if BlobServiceClient is None:
+        raise RuntimeError("Installe le paquet 'azure-storage-blob'.")
+    if CFG["connection_string"]:
+        return BlobServiceClient.from_connection_string(CFG["connection_string"])
+    if CFG["account_url"] and CFG["sas_token"]:
+        return BlobServiceClient(account_url=CFG["account_url"], credential=CFG["sas_token"])
+    if CFG["account_url"] and CFG["account_key"]:
+        return BlobServiceClient(account_url=CFG["account_url"], credential=CFG["account_key"])
+    raise RuntimeError("Config Azure manquante (connection_string ou account_url + sas/account_key).")
+
+def _safe_to_datetime(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce", utc=True)
+
+def _normalize_jsonl_bytes_to_df(data: bytes, limit_rows: Optional[int] = None) -> pd.DataFrame:
+    lines = data.splitlines()
+    if limit_rows: lines = lines[:limit_rows]
+    recs = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln: continue
+        try:
+            recs.append(json.loads(ln))
+        except Exception:
+            continue
+    return pd.DataFrame.from_records(recs)
+
+@st.cache_data(ttl=900, show_spinner=True)
+def load_gold_from_blob(container: str, blob_path: str, sample_rows: Optional[int] = None) -> pd.DataFrame:
+    bsc = _get_blob_service_client()
+    blob_client = bsc.get_blob_client(container=container, blob=blob_path)
     try:
-        return _coerce_json(json.loads(text))
-    except json.JSONDecodeError:
-        rows = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                try: rows.append(json.loads(line))
-                except json.JSONDecodeError: pass
-        return rows
+        data = blob_client.download_blob(max_concurrency=4).readall()
+    except Exception as e:
+        raise RuntimeError(f"Impossible de télécharger '{container}/{blob_path}'. Détail: {e}")
+    df = _normalize_jsonl_bytes_to_df(data, limit_rows=sample_rows)
 
-@st.cache_data(show_spinner=True, ttl=300)
-def load_json_from_blob(connection_string: str, container: str, blob_path: str) -> List[Dict[str, Any]]:
-    return _coerce_json(get_blob_bytes(connection_string, container, blob_path))
+    for c in DATE_COLS:
+        if c in df.columns:
+            df[c] = _safe_to_datetime(df[c])
 
-def pick(row: pd.Series, key: str, default=None):
-    return row[key] if key in row and pd.notna(row[key]) else default
+    if "application_created_at" in df.columns:
+        df["application_date"] = df["application_created_at"].dt.date
+        df["application_year"] = df["application_created_at"].dt.year
 
-def to_str(val) -> str:
-    if val is None or (isinstance(val, float) and pd.isna(val)): return ""
-    return str(val)
+    if "application_outcome" in df.columns:
+        df["application_outcome"] = df["application_outcome"].fillna("unknown")
 
-def join_nonempty(values: List[Any], sep=" ") -> str:
-    return sep.join([to_str(v).strip() for v in values if to_str(v).strip()])
+    # Ne PAS se baser sur is_hired ; on ne touche pas ici.
+    for b in ("is_rejected", "y_hired", "y_offer_made", "act_had_interview"):
+        if b in df.columns:
+            df[b] = df[b].fillna(False).astype(bool)
 
-def csvify_list(val) -> str:
-    if isinstance(val, list): return ", ".join(map(to_str, val))
-    return to_str(val)
+    return df
 
-def normalize_jobs(jobs_raw: List[Dict[str, Any]]) -> pd.DataFrame:
-    df = pd.json_normalize(jobs_raw, sep=".")
-    df["job_id"]      = df.apply(lambda r: pick(r, "job_id"), axis=1)
-    df["title"]       = df.apply(lambda r: pick(r, "title"), axis=1)
-    df["status"]      = df.apply(lambda r: pick(r, "status", ""), axis=1)
-    df["description"] = df.apply(lambda r: pick(r, "body_text", ""), axis=1)
-    df["locations"]   = df.apply(lambda r: csvify_list(pick(r, "locations", [])), axis=1)
-    df["tags"]        = df.apply(lambda r: csvify_list(pick(r, "tags", [])), axis=1)
-    df["department"]  = df.apply(lambda r: pick(r, "department", ""), axis=1)
-    df["division"]    = df.apply(lambda r: pick(r, "division", ""), axis=1)
-    df["created_at"]  = df.apply(lambda r: pick(r, "created_at", ""), axis=1)
-    df["updated_at"]  = df.apply(lambda r: pick(r, "updated_at", ""), axis=1)
-    keep = ["job_id","title","status","description","locations","tags","department","division","created_at","updated_at"]
-    extra = [c for c in df.columns if c not in keep]
-    return df[keep + extra]
+def _percent(n: int, d: int) -> float:
+    return (100.0 * n / d) if d else 0.0
 
-def normalize_apps(apps_raw: List[Dict[str, Any]]) -> pd.DataFrame:
-    df = pd.json_normalize(apps_raw, sep=".")
-    df["application_id"]       = df.apply(lambda r: pick(r, "application_id"), axis=1)
-    df["job_id"]               = df.apply(lambda r: pick(r, "job_id"), axis=1)
-    df["candidate_id"]         = df.apply(lambda r: pick(r, "candidate_id"), axis=1)
-    df["created_at"]           = df.apply(lambda r: pick(r, "created_at"), axis=1)
-    df["updated_at"]           = df.apply(lambda r: pick(r, "updated_at"), axis=1)
-    df["stage_name"]           = df.apply(lambda r: pick(r, "stage_name"), axis=1)
-    df["status"]               = df.apply(lambda r: pick(r, "status"), axis=1)
-    df["decision"]             = df.apply(lambda r: pick(r, "decision"), axis=1)
-    df["rejected_at"]          = df.apply(lambda r: pick(r, "rejected_at"), axis=1)
-    df["reject_reason"]        = df.apply(lambda r: pick(r, "reject_reason_text"), axis=1)
-    df["source_site"]          = df.apply(lambda r: pick(r, "source_site"), axis=1)
-    df["source_url"]           = df.apply(lambda r: pick(r, "source_url"), axis=1)
-    df["sourced"]              = df.apply(lambda r: pick(r, "sourced"), axis=1)
-    df["changed_stage_at"]     = df.apply(lambda r: pick(r, "changed_stage_at"), axis=1)
-    df["cover_letter_present"] = df.apply(lambda r: pick(r, "cover_letter_present"), axis=1)
-    return df[[
-        "application_id","job_id","candidate_id","created_at","updated_at",
-        "stage_name","status","decision","rejected_at","reject_reason",
-        "source_site","source_url","sourced","changed_stage_at","cover_letter_present"
-    ]]
+def _serialize_value(v: Any):
+    if isinstance(v, (pd.Timestamp, datetime, date)):
+        return None if pd.isna(v) else v.isoformat()
+    try:
+        if pd.isna(v): return None
+    except Exception:
+        pass
+    return v
 
-def normalize_candidates(cands_raw: List[Dict[str, Any]]) -> pd.DataFrame:
-    df = pd.json_normalize(cands_raw, sep=".")
-    df["candidate_id"] = df.apply(lambda r: pick(r, "candidate_id"), axis=1)
-    df["first_name"]   = df.apply(lambda r: pick(r, "first_name", ""), axis=1)
-    df["last_name"]    = df.apply(lambda r: pick(r, "last_name", ""), axis=1)
-    df["full_name"]    = [join_nonempty([f,l]) for f,l in zip(df["first_name"], df["last_name"])]
-    df["email"]        = df.apply(lambda r: pick(r, "email"), axis=1)
-    df["phone"]        = df.apply(lambda r: pick(r, "phone"), axis=1)
-    df["location"]     = df.apply(lambda r: pick(r, "location"), axis=1)
-    df["linkedin_url"] = df.apply(lambda r: pick(r, "linkedin_url"), axis=1)
-    df["picture_url"]  = df.apply(lambda r: pick(r, "picture_url"), axis=1)
-    df["created_at"]   = df.apply(lambda r: pick(r, "created_at"), axis=1)
-    df["updated_at"]   = df.apply(lambda r: pick(r, "updated_at"), axis=1)
-    df["source_site"]  = df.apply(lambda r: pick(r, "source_site"), axis=1)
-    df["referring_url"]= df.apply(lambda r: pick(r, "referring_url"), axis=1)
-    df["internal"]     = df.apply(lambda r: pick(r, "internal"), axis=1)
-    df["sourced"]      = df.apply(lambda r: pick(r, "sourced"), axis=1)
-    df["unsubscribed"] = df.apply(lambda r: pick(r, "unsubscribed"), axis=1)
-    keep = ["candidate_id","full_name","location","email","phone","linkedin_url","picture_url","created_at","updated_at","source_site","referring_url","internal","sourced","unsubscribed"]
-    extra = [c for c in df.columns if c not in keep]
-    return df[keep + extra]
+def _download_bytes_from_df(df: pd.DataFrame, kind: str = "csv") -> bytes:
+    if kind == "csv":
+        return df.to_csv(index=False).encode("utf-8")
+    if kind == "jsonl":
+        recs = []
+        for _, row in df.iterrows():
+            recs.append({k: _serialize_value(v) for k, v in row.items()})
+        jsonl = "\n".join(json.dumps(r, ensure_ascii=False) for r in recs)
+        return jsonl.encode("utf-8")
+    raise ValueError("kind doit être 'csv' ou 'jsonl'.")
 
-def is_public_row(row: pd.Series) -> bool:
-    s = str(row.get("status", "") or "").lower()
-    return any(k in s for k in ["public","published","open","active"])
+# --- Sidebar ---
+with st.sidebar:
+    st.header("⚙️ Paramètres & Source")
+    st.caption("Azure Blob → GOLD JSONL")
+    st.text_input("Container", value=CFG["container"], key="container")
+    st.text_input("Blob path (GOLD)", value=CFG["gold_blob"], key="blob_path")
+    st.divider()
+    dev_sample = st.toggle("Charger un échantillon (1000 lignes)", value=False)
+    sample_rows = 1000 if dev_sample else None
+    st.divider()
+    with st.expander("Config détectée"):
+        st.code(
+            {
+                "has_connection_string": bool(CFG["connection_string"]),
+                "has_account_url": bool(CFG["account_url"]),
+                "has_sas_token": bool(CFG["sas_token"]),
+                "has_account_key": bool(CFG["account_key"]),
+                "container": CFG["container"],
+                "gold_blob": CFG["gold_blob"],
+            },
+            language="json",
+        )
 
-def shorten_md(md: str, max_chars: int = 600) -> Tuple[str, bool]:
-    if md is None: return "", False
-    text = str(md)
-    return (text, False) if len(text) <= max_chars else (text[:max_chars].rstrip()+"…", True)
+# --- Load data ---
+st.title("🏠 Dashboard GOLD — Vue d’ensemble")
+st.caption("Source: Azure Blob → GOLD JSONL")
 
-def decision_icon(decision: Optional[str], status: Optional[str], rejected_at: Optional[str]) -> Tuple[str, str]:
-    d = (decision or "").lower().strip()
-    s = (status or "").lower().strip()
-    if d in {"hired","accepted","offer_accepted","offer-accepted","approved","yes"} or s in {"accepted","hired","offer_accepted"}:
-        return "🟢","Accepté"
-    if d in {"rejected","declined","no"} or (rejected_at and str(rejected_at).strip()) or "reject" in s:
-        return "🔴","Refusé"
-    return "🟠","En attente"
-
-# NEW: forcer le nom sur une seule ligne + troncature
-def one_line_name(name: str, max_chars: int = 24) -> str:
-    s = " ".join((name or "").split())      # nettoie espaces multiples
-    if len(s) > max_chars:
-        s = s[:max_chars-1] + "…"
-    return s.replace(" ", "\u00A0")         # espaces insécables
-
-# =========================
-#   Sidebar & chargement
-# =========================
-st.sidebar.header("⚙️ Configuration Blob (lecture)")
-connection_string = st.sidebar.text_input("Connection string Azure","DefaultEndpointsProtocol=https;AccountName=absaifabrik;AccountKey=dHnt6TqjK6GYHvEjLTKenFdRHitSCByxcqenpCAvP/+GkY6XjHk7+BMfSpVuhbSpUi/5EfGq61CR+AStw0NiCA==;EndpointSuffix=core.windows.net" , type="password")
-container_name    = st.sidebar.text_input("Nom du container", "cvcompat")
-
-st.sidebar.subheader("📄 Fichiers Silver (JSONL)")
-blob_jobs       = st.sidebar.text_input("Jobs", "silver/jobs/2025-08-29T08-23-25Z.jsonl")
-blob_apps       = st.sidebar.text_input("Job applications", "silver/job-applications/2025-09-01T08-34-48Z.jsonl")
-blob_candidates = st.sidebar.text_input("Candidates unifié", "silver/candidates_unified/2025-09-01T09-31-47Z.jsonl")
-
-with st.sidebar.expander("🔎 Filtres / Affichage", expanded=True):
-    search_query = st.text_input("Recherche dans titre/description", "")
-    sort_by      = st.selectbox("Trier par", ["Titre (A→Z)", "Nb candidatures (desc)", "Nb candidatures (asc)"])
-    per_row      = st.slider("Cartes job par ligne", 1, 4, 2)
-    page_size    = st.slider("Candidats par page (défilé)", 6, 40, 12, step=2)
-    pills_per_row= st.slider("Pills par ligne", 3, 8, 4)   # <— NOUVEAU : pour la largeur des noms
-    show_pii     = st.checkbox("Afficher e-mail / téléphone (PII)", value=False)
-
-if not connection_string or not container_name:
-    st.info("➡️ Renseigne la **connection string** et le **container**.")
+if BlobServiceClient is None:
+    st.error("Le paquet `azure-storage-blob` est requis. `pip install azure-storage-blob`")
     st.stop()
 
 try:
-    jobs_raw = load_json_from_blob(connection_string, container_name, blob_jobs)
-    apps_raw = load_json_from_blob(connection_string, container_name, blob_apps)
-    cands_raw= load_json_from_blob(connection_string, container_name, blob_candidates)
+    df = load_gold_from_blob(st.session_state["container"], st.session_state["blob_path"], sample_rows)
 except Exception as e:
-    st.error(f"Échec de lecture des blobs. Détails: {e}")
-    st.stop()
+    st.exception(e); st.stop()
 
-df_jobs = normalize_jobs(jobs_raw)
-df_apps = normalize_apps(apps_raw)
-df_cands= normalize_candidates(cands_raw)
+if df.empty:
+    st.warning("Le GOLD est vide ou illisible."); st.stop()
 
-df_jobs_public = df_jobs[df_jobs.apply(is_public_row, axis=1)].copy()
-apps_count = (df_apps.dropna(subset=["job_id"]).groupby("job_id").size().rename("applicants_count").reset_index())
-df_jobs_view = df_jobs_public.merge(apps_count, on="job_id", how="left")
-df_jobs_view["applicants_count"] = df_jobs_view["applicants_count"].fillna(0).astype(int)
+# ─────────────────────────────────────────────────────────────────────────────
+#  RÈGLE MÉTIER DEMANDÉE : outcome basé sur 'stages' (Rejected > Hired)
+# ─────────────────────────────────────────────────────────────────────────────
+STAGE_FIELDS = ["stages", "application_stages", "application_stage_history", "application_stage"]
+stage_col = next((c for c in STAGE_FIELDS if c in df.columns), None)
 
-if search_query.strip():
-    q = search_query.lower().strip()
-    mask = df_jobs_view["title"].astype(str).str.lower().str.contains(q, na=False) | \
-           df_jobs_view["description"].astype(str).str.lower().str.contains(q, na=False)
-    df_jobs_view = df_jobs_view[mask]
+def _jsonloads_if_json_string(x):
+    # Si 'stages' est stocké sous forme de string JSON, on le parse.
+    if isinstance(x, str):
+        s = x.strip()
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+            try:
+                return json.loads(s)
+            except Exception:
+                return x
+    return x
 
-if sort_by == "Titre (A→Z)":
-    df_jobs_view = df_jobs_view.sort_values(by=["title","job_id"])
-elif sort_by == "Nb candidatures (desc)":
-    df_jobs_view = df_jobs_view.sort_values(by=["applicants_count","title"], ascending=[False, True])
-else:
-    df_jobs_view = df_jobs_view.sort_values(by=["applicants_count","title"], ascending=[True, True])
-
-st.success(f"✅ {len(df_jobs_view)} job(s) public(s) chargé(s).")
-
-# =========================
-#   Candidats: pills & détail
-# =========================
-def get_candidates_for_job(job_id: Any) -> pd.DataFrame:
-    apps = df_apps[df_apps["job_id"].astype(str) == str(job_id)].copy()
-    if apps.empty:
-        return pd.DataFrame(columns=["candidate_id","full_name","decision","status","rejected_at","stage_name",
-                                     "created_at","location","linkedin_url","email","phone","source_site","picture_url","reject_reason"])
-    merged = apps.merge(df_cands, on="candidate_id", how="left", suffixes=("", "_cand"))
-    out = pd.DataFrame({
-        "candidate_id": merged["candidate_id"],
-        "full_name": merged["full_name"],
-        "decision": merged["decision"],
-        "status": merged["status"],
-        "rejected_at": merged["rejected_at"],
-        "stage_name": merged["stage_name"],
-        "created_at": merged["created_at"],
-        "location": merged["location"],
-        "linkedin_url": merged["linkedin_url"],
-        "email": merged["email"],
-        "phone": merged["phone"],
-        "source_site": merged["source_site"],
-        "picture_url": merged.get("picture_url", None),
-        "reject_reason": merged.get("reject_reason", None),
-    }).sort_values(by="created_at", ascending=False, na_position="last").reset_index(drop=True)
+def _extract_stage_strings(v: Any) -> list[str]:
+    """Retourne une liste de labels de stages en minuscules."""
+    v = _jsonloads_if_json_string(v)
+    out: list[str] = []
+    if v is None:
+        return out
+    if isinstance(v, str):
+        # Exemple: "Applied > Interview > Hired"
+        out = [p.strip().lower() for p in v.replace(">", ",").split(",") if p.strip()]
+    elif isinstance(v, list):
+        for item in v:
+            if isinstance(item, str):
+                out.append(item.strip().lower())
+            elif isinstance(item, dict):
+                # supporte clés fréquentes
+                s = item.get("name") or item.get("stage") or item.get("title") or item.get("label") or ""
+                if s:
+                    out.append(str(s).strip().lower())
+            else:
+                out.append(str(item).strip().lower())
+    elif isinstance(v, dict):
+        # un dict unique
+        s = v.get("name") or v.get("stage") or v.get("title") or v.get("label") or ""
+        if s:
+            out.append(str(s).strip().lower())
+    else:
+        out.append(str(v).strip().lower())
     return out
 
-def render_candidate_detail(row: pd.Series):
-    emoji, label = decision_icon(row.get("decision"), row.get("status"), row.get("rejected_at"))
-    st.markdown(f"#### {row.get('full_name') or row.get('candidate_id')}")
-    st.caption(f"{emoji} {label} • Stage: {row.get('stage_name') or '—'} • Statut: {row.get('status') or '—'} • Candidature: {row.get('created_at') or '—'}")
-    c1, c2 = st.columns([2,1])
-    with c1:
-        st.markdown(f"**Localisation** : {row.get('location') or '—'}")
-        st.markdown(f"**Source** : {row.get('source_site') or '—'}")
-        if row.get("linkedin_url"): st.link_button("Profil LinkedIn", row.get("linkedin_url"))
-        if row.get("reject_reason"): st.markdown(f"**Raison de rejet** : {row.get('reject_reason')}")
-    with c2:
-        if row.get("picture_url"): st.image(row.get("picture_url"), caption="Photo", use_column_width=True)
-        if show_pii:
-            st.markdown(f"**Email** : {row.get('email') or '—'}")
-            st.markdown(f"**Téléphone** : {row.get('phone') or '—'}")
+def _has_any(labels: Iterable[str], needles: Iterable[str]) -> bool:
+    sset = {x.lower() for x in labels}
+    for n in needles:
+        n = n.lower()
+        # match exact ou substring (au cas où "hired (moved)")
+        if any(n in lab for lab in sset):
+            return True
+    return False
 
-def render_job_card(row: pd.Series):
-    job_id = row.get("job_id"); title = row.get("title") or f"Job {job_id}"
-    desc = row.get("description", "")
-    short, truncated = shorten_md(desc, max_chars=600)
-    applicants = int(row.get("applicants_count", 0))
+if stage_col:
+    stage_labels = df[stage_col].map(_extract_stage_strings)
+    has_stage_hired = stage_labels.map(lambda labs: _has_any(labs, ["hired"]))
+    has_stage_rejected = stage_labels.map(lambda labs: _has_any(labs, ["rejected", "declined", "not hired"]))
+else:
+    # Fallback si pas de colonne stages — on ne se base PAS sur is_hired, seulement sur dates
+    has_stage_hired = pd.Series(False, index=df.index)
+    has_stage_rejected = pd.Series(False, index=df.index)
 
-    st.markdown(f"### {title}")
-    meta1, meta2 = st.columns([3,2])
-    with meta1:
-        st.caption(f"ID: `{job_id}` | Status: `{row.get('status')}` | Lieux: {row.get('locations') or '—'} | Tags: {row.get('tags') or '—'}")
-    with meta2:
-        st.caption(f"Dept/Div: {row.get('department') or '—'} / {row.get('division') or '—'} | Créé: {row.get('created_at') or '—'} | Maj: {row.get('updated_at') or '—'}")
-    st.metric("Candidatures", value=applicants)
+# Fallback dates si pas de 'stages' renseigné sur la ligne
+has_hired_date = df["hired_at"].notna() if "hired_at" in df.columns else pd.Series(False, index=df.index)
+has_rejected_date = df["rejected_at"].notna() if "rejected_at" in df.columns else pd.Series(False, index=df.index)
 
-    if truncated:
-        with st.expander("Voir la description complète"): st.markdown(desc if desc else "_(pas de description)_")
+# Priorité: Rejected > Hired
+df["effective_is_rejected"] = (has_stage_rejected | has_rejected_date).astype(bool)
+df["effective_is_hired"] = ((~df["effective_is_rejected"]) & (has_stage_hired | has_hired_date)).astype(bool)
+
+# Outcome effectif final
+orig_outcome = df.get("application_outcome", pd.Series("unknown", index=df.index)).fillna("unknown")
+df["application_outcome_effective"] = np.where(
+    df["effective_is_rejected"], "rejected",
+    np.where(df["effective_is_hired"], "hired", orig_outcome)
+)
+
+# --- Filtres ---
+with st.container():
+    st.subheader("🔎 Filtres")
+    col1, col2, col3, col4 = st.columns(4)
+
+    if "application_created_at" in df.columns and not df["application_created_at"].isna().all():
+        min_d = df["application_created_at"].min().date()
+        max_d = df["application_created_at"].max().date()
     else:
-        st.markdown(short if short else "_(pas de description)_")
+        min_d, max_d = date(2000, 1, 1), date.today()
 
-    with st.expander(f"👥 Candidats — {applicants}"):
-        cands = get_candidates_for_job(job_id)
+    with col1:
+        dr = st.date_input("Période (création)", (min_d, max_d), min_value=min_d, max_value=max_d)
 
-        page_key = f"page_{job_id}"
-        sel_key  = f"selected_cand_{job_id}"
-        if page_key not in st.session_state: st.session_state[page_key] = 0
-        if sel_key not in st.session_state:  st.session_state[sel_key] = None
+    stages_list = sorted([x for x in df.get("application_stage", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])
+    outcomes = sorted([x for x in df.get("application_outcome_effective", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])
+    with col2:
+        selected_stages = st.multiselect("Stages (courant)", stages_list)
+    with col3:
+        selected_outcomes = st.multiselect("Outcome (effectif)", outcomes)
 
-        total = len(cands)
-        if total == 0:
-            st.info("Aucune candidature pour cette offre.")
-        else:
-            max_page = max(0, (total - 1) // page_size)
-            nav1, nav2, nav3 = st.columns([1,2,1])
-            with nav1:
-                if st.button("◀", key=f"prev_{job_id}", use_container_width=True) and st.session_state[page_key] > 0:
-                    st.session_state[page_key] -= 1
-            with nav2:
-                st.caption(f"Page {st.session_state[page_key] + 1} / {max_page + 1} — {total} candidats")
-            with nav3:
-                if st.button("▶", key=f"next_{job_id}", use_container_width=True) and st.session_state[page_key] < max_page:
-                    st.session_state[page_key] += 1
+    with col4:
+        dept = st.selectbox("Département", ["(Tous)"] + sorted(df.get("job_department", pd.Series(dtype=str)).dropna().unique().tolist()))
+    col5, col6 = st.columns(2)
+    with col5:
+        title_query = st.text_input("Recherche titre d'offre (contient)")
+    with col6:
+        only_has_interview = st.toggle("Uniquement avec entretien", value=False)
 
-            start = st.session_state[page_key] * page_size
-            end   = min(start + page_size, total)
-            window = cands.iloc[start:end]
+mask = pd.Series(True, index=df.index)
 
-            # ——— Chips/pills sur une ou plusieurs rangées ———
-            cols_per_row = int(pills_per_row)  # <— contrôlable dans la sidebar
-            rows_needed = (len(window) + cols_per_row - 1) // cols_per_row
-            idx = 0
-            for _ in range(rows_needed):
-                cols = st.columns(cols_per_row)
-                for col in cols:
-                    if idx >= len(window): break
-                    wrow = window.iloc[idx]; idx += 1
-                    emoji, _ = decision_icon(wrow.get("decision"), wrow.get("status"), wrow.get("rejected_at"))
-                    label = f"{emoji} {one_line_name(wrow.get('full_name') or str(wrow.get('candidate_id')))}"
-                    with col:
-                        if st.button(label, key=f"btn_{job_id}_{wrow.get('candidate_id')}", use_container_width=True):
-                            st.session_state[sel_key] = wrow.get("candidate_id")
+if "application_created_at" in df.columns and isinstance(dr, tuple) and len(dr) == 2:
+    start_dt = pd.Timestamp(dr[0]).tz_localize("UTC") if pd.Timestamp(dr[0]).tz is None else pd.Timestamp(dr[0])
+    end_dt = (pd.Timestamp(dr[1]).tz_localize("UTC") if pd.Timestamp(dr[1]).tz is None else pd.Timestamp(dr[1])) + pd.Timedelta(days=1)
+    mask &= (df["application_created_at"] >= start_dt) & (df["application_created_at"] < end_dt)
 
-            if st.session_state[sel_key]:
-                selected = cands[cands["candidate_id"] == st.session_state[sel_key]]
-                if not selected.empty:
-                    st.markdown("---")
-                    render_candidate_detail(selected.iloc[0])
-                else:
-                    st.warning("Candidat introuvable dans la page courante.")
+if selected_stages and "application_stage" in df.columns:
+    mask &= df["application_stage"].isin(selected_stages)
 
-    st.divider()
+if selected_outcomes and "application_outcome_effective" in df.columns:
+    mask &= df["application_outcome_effective"].isin(selected_outcomes)
 
-# ——— Affichage des jobs en grille ———
-cards_per_row = max(1, int(per_row))
-rows = [df_jobs_view.iloc[i:i+cards_per_row] for i in range(0, len(df_jobs_view), cards_per_row)]
-for chunk in rows:
-    cols = st.columns(len(chunk))
-    for c, (_, r) in zip(cols, chunk.iterrows()):
-        with c: render_job_card(r)
+if dept != "(Tous)" and "job_department" in df.columns:
+    mask &= (df["job_department"] == dept)
 
-# Debug (optionnel)
-with st.expander("🔬 Diagnostic (schémas détectés)"):
-    st.write("**Colonnes jobs**:", list(df_jobs.columns)); st.json(df_jobs.head(1).to_dict(orient="records"))
-    st.write("**Colonnes job applications**:", list(df_apps.columns)); st.dataframe(df_apps)
-    st.write("**Colonnes candidates**:", list(df_cands.columns)); st.dataframe(df_cands[["candidate_id","full_name","location","email","phone","linkedin_url","source_site"]].head(10))
+if title_query and "job_title" in df.columns:
+    q = title_query.strip().lower()
+    mask &= df["job_title"].fillna("").str.lower().str.contains(q, na=False)
 
-st.caption("ℹ️ Cache 5 min. POC : lecture blobs Silver uniquement (JSONL).")
+if only_has_interview and "act_had_interview" in df.columns:
+    mask &= df["act_had_interview"] == True
+
+df_f = df.loc[mask].copy()
+
+# --- KPIs (effectifs) ---
+st.subheader("📈 Indicateurs clés")
+total_apps = len(df_f)
+n_hired = int(df_f.get("effective_is_hired", pd.Series(False, index=df_f.index)).sum())
+n_rejected = int(df_f.get("effective_is_rejected", pd.Series(False, index=df_f.index)).sum())
+n_offer = int(df_f.get("y_offer_made", pd.Series(False, index=df_f.index)).sum())
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Candidatures", f"{total_apps:,}")
+c2.metric("Hirings (effectif)", f"{n_hired:,}", f"{_percent(n_hired, total_apps):.1f}%")
+c3.metric("Rejets (effectif)", f"{n_rejected:,}", f"{_percent(n_rejected, total_apps):.1f}%")
+c4.metric("Offres faites", f"{n_offer:,}", f"{_percent(n_offer, total_apps):.1f}%")
+
+# --- Table ---
+st.subheader("📄 Données filtrées")
+priority_cols = [
+    "application_id", "application_created_at", "application_stage",
+    "application_outcome_effective", "application_outcome",
+    "job_id", "job_title", "job_department",
+    "candidate_id", "cand_full_name", "cand_current_title",
+    "effective_is_hired", "effective_is_rejected",
+    "y_offer_made", "act_had_interview", "rejection_reason",
+]
+cols_show = [c for c in priority_cols if c in df_f.columns] + [c for c in df_f.columns if c not in priority_cols]
+st.dataframe(df_f[cols_show].head(1000), use_container_width=True, hide_index=True)
+
+# --- Onglets ---
+tab1, tab2, tab3 = st.tabs(["📊 Vue d'ensemble & Export", "📈 Graphiques & Analyse", "🤖 Scoring Rapide"])
+
+with tab1:
+    # --- Exports ---
+    st.subheader("⬇️ Export")
+    colx, coly, colz = st.columns(3)
+    with colx:
+        st.download_button(
+            "Télécharger (CSV)",
+            data=_download_bytes_from_df(df_f, "csv"),
+            file_name="applications_gold_filtered.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with coly:
+        st.download_button(
+            "Télécharger (JSONL)",
+            data=_download_bytes_from_df(df_f, "jsonl"),
+            file_name="applications_gold_filtered.jsonl",
+            mime="application/x-ndjson",
+            use_container_width=True,
+        )
+    with colz:
+        st.caption(f"Colonnes: {len(df_f.columns)} | Lignes filtrées: {len(df_f):,}")
+
+    # --- Debug ---
+    with st.expander("🛠️ Aide & Debug"):
+        st.write("**Colonne utilisée pour stages:**", stage_col or "(aucune trouvée)")
+        if stage_col:
+            st.write("Exemples de stages (premières lignes):")
+            st.write(df[stage_col].head(5))
+        st.write("**Colonnes disponibles (extrait):**")
+        st.code(df.columns.tolist(), language="python")
+        st.write("**dtypes:**"); st.write(df_f.dtypes.astype(str))
+        if "application_created_at" in df_f.columns and not df_f.empty:
+            st.write("**Dates min/max (application_created_at):**", df_f["application_created_at"].min(), "→", df_f["application_created_at"].max())
+        st.write("**Exemple de ligne (préparée pour JSON):**")
+        st.json({k: _serialize_value(v) for k, v in (df_f.iloc[0].to_dict() if not df_f.empty else {}).items()})
+
+    st.success("✅ Règle outcome=stages appliquée (Rejected > Hired) + export JSONL compatible.", icon="✅")
+
+with tab2:
+    st.subheader("📈 Analyse Graphique des Données")
+
+    # Palette de couleurs violette du thème
+    violet_palette = ["#DDD3FD", "#BCA7FA", "#9A7BF8", "#5525E4", "#4321A6", "#2D1574", "#1E1047"]
+    primary_violet = "#5525E4"
+    dark_violet = "#2D1574"
+
+    if not df_f.empty:
+        # Graphique 1: Evolution temporelle des candidatures
+        if "application_created_at" in df_f.columns:
+            st.markdown("#### 📅 Candidatures par jour")
+            df_by_date = df_f.groupby(df_f["application_created_at"].dt.date).size().reset_index(name="count")
+            fig_timeline = px.line(
+                df_by_date,
+                x="application_created_at",
+                y="count",
+                title="Nombre de candidatures par jour",
+                labels={"application_created_at": "Date", "count": "Nombre de candidatures"},
+                markers=True
+            )
+            fig_timeline.update_traces(line=dict(color=primary_violet, width=3), marker=dict(size=8, color=primary_violet))
+            fig_timeline.update_layout(height=400, hovermode="x unified")
+            st.plotly_chart(fig_timeline, use_container_width=True)
+
+        # Graphique 2: Top offres (job titles)
+        if "job_title" in df_f.columns:
+            st.markdown("#### 💼 Top 10 Offres")
+            top_jobs = df_f["job_title"].value_counts().head(10).reset_index()
+            top_jobs.columns = ["Job Title", "Count"]
+
+            fig_jobs = px.bar(
+                top_jobs,
+                x="Count",
+                y="Job Title",
+                orientation="h",
+                title="Offres avec le plus de candidatures",
+                color="Count",
+                color_continuous_scale=violet_palette
+            )
+            fig_jobs.update_layout(height=400, coloraxis_colorbar=dict(title="Nombre"))
+            fig_jobs.update_traces(marker=dict(line=dict(color=dark_violet, width=0.5)))
+            st.plotly_chart(fig_jobs, use_container_width=True)
+
+        # Graphique 3: Taux de succès (Hired) par département
+        if "job_department" in df_f.columns and "effective_is_hired" in df_f.columns:
+            st.markdown("#### 🎯 Taux de succès par département")
+
+            # Calculer le taux de hired par département
+            dept_stats = df_f.groupby("job_department").agg({
+                "effective_is_hired": ["sum", "count"]
+            }).reset_index()
+            dept_stats.columns = ["Department", "Hired", "Total"]
+            dept_stats["Taux de succès (%)"] = (dept_stats["Hired"] / dept_stats["Total"] * 100).round(1)
+
+            # Filtrer les départements avec au moins 5 candidatures pour avoir des stats significatives
+            dept_stats = dept_stats[dept_stats["Total"] >= 5].sort_values("Taux de succès (%)", ascending=False).head(10)
+
+            if not dept_stats.empty:
+                fig_success_rate = px.bar(
+                    dept_stats,
+                    x="Department",
+                    y="Taux de succès (%)",
+                    title="Taux de recrutement par département (min. 5 candidatures)",
+                    color="Taux de succès (%)",
+                    color_continuous_scale=violet_palette,
+                    hover_data={"Total": True, "Hired": True}
+                )
+                fig_success_rate.update_layout(height=400, xaxis_tickangle=-45, coloraxis_colorbar=dict(title="Taux (%)"))
+                fig_success_rate.update_traces(marker=dict(line=dict(color=dark_violet, width=0.5)))
+                st.plotly_chart(fig_success_rate, use_container_width=True)
+
+        # Graphique 4: Distribution Outcome (Pie chart simplifié)
+        if "application_outcome_effective" in df_f.columns:
+            st.markdown("#### 📊 Distribution des résultats")
+            outcome_counts = df_f["application_outcome_effective"].value_counts().reset_index()
+            outcome_counts.columns = ["Outcome", "Count"]
+
+            fig_outcome = px.pie(
+                outcome_counts,
+                names="Outcome",
+                values="Count",
+                title="Répartition Hired / Rejected / Autres",
+                hole=0.4,
+                color_discrete_sequence=violet_palette[:len(outcome_counts)]
+            )
+            fig_outcome.update_traces(textposition="inside", textinfo="label+percent+value")
+            st.plotly_chart(fig_outcome, use_container_width=True)
+    else:
+        st.warning("❌ Aucune donnée disponible pour cette sélection")
+
+with tab3:
+    st.subheader("🤖 Scoring Rapide d'une Paire Job/CV")
+    st.info("💡 Testez l'API de scoring pour calculer la compatibilité entre un job et un CV")
+
+    # Vérifier que l'API est accessible
+    try:
+        api_health = requests.get(f"{API_URL}/healthz", timeout=5)
+        api_available = api_health.status_code == 200
+    except:
+        api_available = False
+
+    if not api_available:
+        st.error(f"❌ API non accessible à {API_URL}. Assurez-vous que le serveur FastAPI est en cours d'exécution.")
+        st.code("python api/main.py", language="bash")
+    else:
+        st.success("✅ API accessible")
+
+        # Deux modes de scoring
+        scoring_mode = st.radio("Mode de scoring", ["📝 Formulaire texte", "🔗 Depuis les données GOLD"])
+
+        if scoring_mode == "📝 Formulaire texte":
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("### 💼 Informations du Job")
+                job_title = st.text_input("Titre du poste", "Senior Data Engineer")
+                job_desc = st.text_area(
+                    "Description du job",
+                    "We are looking for a senior data engineer with 5+ years of experience. Required: Python, Spark, Airflow, AWS.",
+                    height=150
+                )
+                job_skills = st.text_input("Compétences requises (séparées par virgule)", "Python, Spark, Airflow, AWS")
+                job_years = st.number_input("Années d'expérience requises", min_value=0, value=5)
+                job_languages = st.multiselect("Langues requises", ["Français", "Anglais", "Autre"], default=["Français"])
+
+            with col2:
+                st.markdown("### 👤 Informations du CV")
+                cv_text = st.text_area(
+                    "Résumé du CV / Expérience",
+                    "Senior Data Engineer with 7 years of experience. Expertise in Python, Spark, Airflow, AWS, Kubernetes. Worked on ETL pipelines and data warehousing.",
+                    height=150
+                )
+                cv_skills = st.text_input("Compétences du candidat (séparées par virgule)", "Python, Spark, Airflow, AWS, Kubernetes, Docker")
+                cv_years = st.number_input("Années d'expérience du candidat", min_value=0, value=7)
+                cv_languages = st.multiselect("Langues du candidat", ["Français", "Anglais", "Autre"], default=["Anglais"])
+
+            if st.button("🚀 Calculer le score", use_container_width=True):
+                with st.spinner("⏳ Calcul du score en cours..."):
+                    try:
+                        payload = {
+                            "job": {
+                                "job_title": job_title,
+                                "job_description_text": job_desc,
+                                "job_required_skills_plus": [s.strip() for s in job_skills.split(",")],
+                                "job_required_years_num": int(job_years),
+                                "job_languages_required": job_languages,
+                            },
+                            "cv": {
+                                "text_cv_full": cv_text,
+                                "text_cv_skills": cv_skills,
+                                "cv_years_experience_num": int(cv_years),
+                                "cv_languages": cv_languages,
+                            }
+                        }
+
+                        response = requests.post(
+                            f"{API_URL}/score",
+                            json=payload,
+                            params={"include_features": True},
+                            timeout=120
+                        )
+
+                        if response.status_code == 200:
+                            result = response.json()
+                            st.success("✅ Score calculé avec succès!")
+
+                            # Afficher les scores
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("Score Global", f"{result.get('score_global', 0):.3f}")
+                            with col2:
+                                st.metric("Score Type", f"{result.get('score_type', 'N/A')}" if result.get('score_type') else "N/A")
+                            with col3:
+                                st.metric("Score Final", f"{result.get('score_final', 0):.3f}")
+                            with col4:
+                                pred_text = "✅ ACCEPTÉ" if result.get('pred') == 1 else "❌ REJETÉ"
+                                st.metric("Prédiction", pred_text)
+
+                            # Afficher les features
+                            st.markdown("### 📊 Features Calculées (21 features)")
+                            features = result.get("features_used", {})
+
+                            # Regrouper par catégorie
+                            categories = {
+                                "Similarité (4)": ["sim_dense_full", "sim_sparse_tfidf", "sim_exp_title", "sim_exp_responsibilities"],
+                                "Skills (4)": ["skill_gap_ratio", "skill_gap_per_year_required", "cov_soft_skills", "critical_skills_blocker"],
+                                "Expérience (3)": ["job_required_years_num", "exp_gap_years", "overqualification_penalty"],
+                                "Seniority (1)": ["seniority_gap"],
+                                "Langues (1)": ["lang_required_coverage"],
+                                "École (1)": ["ecole"],
+                                "Composites (2)": ["sim_x_seniority", "soft_skills_weighted"],
+                                "Positionnement (1)": ["rank_in_offer_pool_norm"],
+                                "Sélectivité (2)": ["job_selectivity_historical", "job_competition_index_norm"],
+                                "Phase 4J (2)": ["is_low_selectivity_boost", "job_candidate_mismatch_flags"],
+                            }
+
+                            for category, feat_names in categories.items():
+                                with st.expander(f"{category}"):
+                                    feature_cols = st.columns(2)
+                                    for i, feat_name in enumerate(feat_names):
+                                        col = feature_cols[i % 2]
+                                        if feat_name in features:
+                                            col.metric(feat_name, f"{features[feat_name]:.4f}")
+                                        else:
+                                            col.warning(f"❌ {feat_name} manquante")
+                        else:
+                            st.error(f"❌ Erreur API: {response.status_code}")
+                            st.code(response.text)
+                    except requests.exceptions.Timeout:
+                        st.error("⏱️ Timeout: La requête a pris trop de temps (>120s)")
+                    except Exception as e:
+                        st.error(f"❌ Erreur: {str(e)}")
+
+        else:  # Mode GOLD
+            st.markdown("### Sélectionner une paire depuis GOLD")
+
+            if not df_f.empty:
+                # Sélectionner une application
+                selected_app_id = st.selectbox(
+                    "Sélectionner une candidature",
+                    df_f["application_id"].unique() if "application_id" in df_f.columns else [],
+                    format_func=lambda x: f"App {x} - {df_f[df_f['application_id'] == x]['job_title'].values[0] if 'job_title' in df_f.columns else 'N/A'}"
+                )
+
+                if selected_app_id:
+                    app_row = df_f[df_f["application_id"] == selected_app_id].iloc[0]
+
+                    st.info(f"📋 Application: {selected_app_id}")
+
+                    if st.button("🚀 Scorer cette paire", use_container_width=True):
+                        with st.spinner("⏳ Calcul du score..."):
+                            try:
+                                # Construire le payload à partir des données GOLD
+                                payload = {
+                                    "pair_id": selected_app_id,
+                                    "job": {
+                                        "job_id": app_row.get("job_id", ""),
+                                        "job_title": app_row.get("job_title", ""),
+                                        "job_description_text": app_row.get("job_description_text", ""),
+                                    },
+                                    "cv": {
+                                        "candidate_id": app_row.get("candidate_id", ""),
+                                        "text_cv_full": app_row.get("text_cv_full", ""),
+                                    }
+                                }
+
+                                response = requests.post(
+                                    f"{API_URL}/score",
+                                    json=payload,
+                                    params={"include_features": True},
+                                    timeout=120
+                                )
+
+                                if response.status_code == 200:
+                                    result = response.json()
+                                    st.success("✅ Score calculé!")
+
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        st.metric("Score Global", f"{result.get('score_global', 0):.3f}")
+                                    with col2:
+                                        st.metric("Score Type", f"{result.get('score_type', 'N/A')}" if result.get('score_type') else "N/A")
+                                    with col3:
+                                        st.metric("Score Final", f"{result.get('score_final', 0):.3f}")
+                                    with col4:
+                                        pred_text = "✅ ACCEPTÉ" if result.get('pred') == 1 else "❌ REJETÉ"
+                                        st.metric("Prédiction", pred_text)
+                                else:
+                                    st.error(f"❌ Erreur API: {response.status_code}")
+                            except Exception as e:
+                                st.error(f"❌ Erreur: {str(e)}")
+            else:
+                st.warning("❌ Aucune candidature disponible avec les filtres sélectionnés")

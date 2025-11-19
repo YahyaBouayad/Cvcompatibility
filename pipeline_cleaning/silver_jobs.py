@@ -6,11 +6,47 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.core.exceptions import ResourceNotFoundError
+# --- NEW (si manquants) ---
+import time, math
+import requests
+
+# =============== LLM Job Segmentation (Azure OpenAI) ===============
+AZURE_OPENAI_ENDPOINT   = "https://saegus-openai-us.openai.azure.com"
+AZURE_OPENAI_API_KEY    = "bd43498be60845caa72d6963645dd1e1"
+AZURE_OPENAI_API_VER    = "2024-12-01-preview"
+JOBS_LLM_DEPLOYMENT     = "gpt-4o"
+
+# Toggle & throttle
+JOBS_LLM_SEGMENT        = "1" # "1" pour activer
+JOBS_LLM_RPM            = 30000  # appels/min max
+_last_call_ts           = [0.0]
+
 
 AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=absaifabrik;AccountKey=dHnt6TqjK6GYHvEjLTKenFdRHitSCByxcqenpCAvP/+GkY6XjHk7+BMfSpVuhbSpUi/5EfGq61CR+AStw0NiCA==;EndpointSuffix=core.windows.net"
 AZURE_BLOB_CONTAINER="cvcompat"
 
-
+JOB_JSON_SCHEMA_EXAMPLE = {
+    "job": {
+        "title": "string",
+        "language": "fr|en|...",
+        "sections": {
+            "responsibilities": {"bullets": ["string"], "text": "string"},
+            "requirements_must": {
+                "skills": ["string"], "bullets": ["string"], "text": "string",
+                "years_required": {"min": 0.0, "preferred": 0.0}
+            },
+            "requirements_nice": {"skills": ["string"], "bullets": ["string"], "text": "string"},
+            "languages": [{"code": "fr", "level": "C1"}],
+            "education": {"level": "bac+5/master|bac+3/licence|bac+2|phd|...", "fields": ["string"], "text": "string"},
+            "contract": {"type": "permanent|contract|internship|apprenticeship|part-time|freelance", "text": "string"},
+            "remote": {"type": "remote|hybrid|on-site", "text": "string"},
+            "salary": {"min": 0.0, "max": 0.0, "currency": "EUR|USD|...", "period": "year|month", "raw": "string"},
+            "benefits": {"bullets": ["string"], "text": "string"},
+            "company": {"text": "string"}
+        },
+        "keywords": ["string"]
+    }
+}
 
 
 # =============== Utils ===============
@@ -36,6 +72,19 @@ def to_iso(ts: Optional[str]) -> Optional[str]:
 def word_count(txt: Optional[str]) -> Optional[int]:
     if not txt: return None
     return len(re.findall(r"\w+", txt, flags=re.UNICODE))
+
+def _throttle():
+    if JOBS_LLM_RPM <= 0: return
+    min_interval = 60.0 / JOBS_LLM_RPM
+    since = time.time() - _last_call_ts[0]
+    if since < min_interval:
+        time.sleep(min_interval - since)
+    _last_call_ts[0] = time.time()
+
+def _truncate(txt: str, max_chars: int = 12000) -> str:
+    if not isinstance(txt, str): return ""
+    if len(txt) <= max_chars: return txt
+    return txt[:max_chars]
 
 # =============== HTML → text ===============
 def html_to_text(html: Optional[str]) -> Optional[str]:
@@ -81,6 +130,198 @@ def upload_text(container, path: str, text: str, overwrite: bool = False, conten
         text.encode("utf-8"), overwrite=overwrite,
         content_settings=ContentSettings(content_type=content_type)
     )
+
+
+#================LLM Segmenter (Azure OpenAI) ===============
+def _llm_messages_for_job(title: str, body_text: str, language_code: Optional[str]) -> list:
+    sys = (
+        "You are an ATS Job Description segmenter. "
+        "Extract a clean, structured JSON for the job below. "
+        "Return STRICT JSON only. No commentary. "
+        "Prefer the language of the job text (FR/EN). "
+        "If a section is absent, return empty arrays/empty strings, not null."
+    )
+    user = {
+        "task": "Segment this job into structured sections.",
+        "json_contract": JOB_JSON_SCHEMA_EXAMPLE,
+        "hints": [
+            "Detect skills (hard/soft) in must vs nice.",
+            "Infer languages (codes: fr,en,es,de,it,pt,ar,...) and CEFR levels if present (A1–C2).",
+            "Extract years_required (min, preferred) if ranges (ex: 3–5 ans → min=3, preferred=5).",
+            "Infer remote/contract if present in text.",
+            "Detect benefits (tickets resto, mutuelle, etc.).",
+            "Salary: extract min/max + currency + period; put original span in 'raw'.",
+            "Education: map levels to categories (bac+2, bac+3/licence, bac+5/master, phd...).",
+        ],
+        "job_title": title or "",
+        "job_language_hint": language_code or "",
+        "job_body_text": _truncate(body_text, 12000),
+    }
+    return [
+        {"role":"system","content":sys},
+        {"role":"user","content":json.dumps(user, ensure_ascii=False)}
+    ]
+
+def _azure_chat_completions(endpoint: str, deployment: str, api_key: str, api_version: str, messages: list, max_tokens: int = 2000):
+    """
+    Appel direct REST Azure Chat Completions pour éviter les soucis de SDK.
+    """
+    url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    headers = {"Content-Type":"application/json", "api-key": api_key}
+    payload = {
+        "messages": messages,
+        "temperature": 0,
+        "n": 1,
+        "max_tokens": max_tokens,
+        # Guide JSON strict (Azure supporte response_format.type=json_object)
+        "response_format": {"type": "json_object"}
+    }
+    _throttle()
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Azure Chat error {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+    return content
+
+def _try_parse_json(s: str):
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+def segment_job_with_llm(title: Optional[str], body_text: Optional[str], language_code: Optional[str]) -> dict:
+    """
+    Retourne un dict (toujours) avec:
+      - "ok": bool
+      - "data": dict JSON (ou {})
+      - "error": str (si échec)
+    """
+    if JOBS_LLM_SEGMENT not in {"1","true","TRUE","yes","YES"}:
+        return {"ok": False, "data": {}, "error": "LLM disabled via JOBS_LLM_SEGMENT"}
+    if not (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY and JOBS_LLM_DEPLOYMENT):
+        return {"ok": False, "data": {}, "error": "Azure OpenAI env vars missing"}
+
+    if not body_text:
+        return {"ok": False, "data": {}, "error": "empty body_text"}
+
+    msgs = _llm_messages_for_job(title or "", body_text or "", language_code)
+    try:
+        raw = _azure_chat_completions(
+            endpoint=AZURE_OPENAI_ENDPOINT.rstrip("/"),
+            deployment=JOBS_LLM_DEPLOYMENT,
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VER,
+            messages=msgs,
+            max_tokens=2200,
+        )
+        data = _try_parse_json(raw)
+        if data is None:
+            # tentative de réparation simple
+            fix_msgs = msgs + [{"role":"user","content":"Return the SAME content as STRICT valid JSON only. No prose."}]
+            raw2 = _azure_chat_completions(
+                AZURE_OPENAI_ENDPOINT.rstrip("/"),
+                JOBS_LLM_DEPLOYMENT,
+                AZURE_OPENAI_API_KEY,
+                AZURE_OPENAI_API_VER,
+                fix_msgs, max_tokens=2200
+            )
+            data = _try_parse_json(raw2)
+            if data is None:
+                return {"ok": False, "data": {}, "error": "invalid JSON from LLM"}
+        return {"ok": True, "data": data, "error": ""}
+    except Exception as e:
+        return {"ok": False, "data": {}, "error": str(e)[:500]}
+
+def _listify(x):
+    if x is None: return []
+    if isinstance(x, list): return [t for t in x if isinstance(t, str) and t.strip()]
+    if isinstance(x, str): return [x] if x.strip() else []
+    return []
+
+def _get(d, path, default=None):
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict): return default
+        cur = cur.get(p)
+        if cur is None: return default
+    return cur
+
+def _float_or_none(x):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except: return None
+
+def flatten_job_llm_segments(seg_json: dict) -> dict:
+    """
+    Aplati quelques champs utiles depuis le JSON LLM.
+    """
+    out = {}
+    sec = _get(seg_json, ["job","sections"], {}) or {}
+
+    # Lists
+    out["job_requirements_list_llm"]   = _listify(_get(sec, ["requirements_must","bullets"], []))
+    out["job_responsibilities_list_llm"]= _listify(_get(sec, ["responsibilities","bullets"], []))
+    out["job_nice_list_llm"]           = _listify(_get(sec, ["requirements_nice","bullets"], []))
+    out["job_benefits_list_llm"]       = _listify(_get(sec, ["benefits","bullets"], []))
+
+    # Text blocks
+    out["job_requirements_text_llm"]   = _get(sec, ["requirements_must","text"])
+    out["job_responsibilities_text_llm"]= _get(sec, ["responsibilities","text"])
+    out["job_nice_text_llm"]           = _get(sec, ["requirements_nice","text"])
+    out["job_benefits_text_llm"]       = _get(sec, ["benefits","text"])
+    out["job_languages_text_llm"]      = ", ".join([json.dumps(x, ensure_ascii=False) for x in (_get(sec,["languages"],[]) or [])]) or None
+    out["job_salary_text_llm"]         = _get(sec, ["salary","raw"])
+    out["job_contract_text_llm"]       = _get(sec, ["contract","text"])
+    out["job_remote_text_llm"]         = _get(sec, ["remote","text"])
+    out["job_education_text_llm"]      = _get(sec, ["education","text"])
+
+    # Structured: skills, languages, years, salary, contract/remote/education
+    out["required_skills_must_llm"] = _listify(_get(sec, ["requirements_must","skills"], []))
+    out["required_skills_plus_llm"] = _listify(_get(sec, ["requirements_nice","skills"], []))
+
+    langs = _get(sec, ["languages"], []) or []
+    # store list of codes; keep full JSON separately
+    codes = []
+    for x in langs:
+        if isinstance(x, dict):
+            code = x.get("code")
+            if isinstance(code, str) and code.strip():
+                codes.append(code.lower().strip())
+    out["required_languages_llm"] = sorted(list(set(codes))) if codes else []
+
+    yrs = _get(sec, ["requirements_must","years_required"], {}) or {}
+    out["job_years_required_min_llm"]       = _float_or_none(yrs.get("min"))
+    out["job_years_required_preferred_llm"] = _float_or_none(yrs.get("preferred"))
+
+    sal = _get(sec, ["salary"], {}) or {}
+    out["job_salary_min_llm"]      = _float_or_none(sal.get("min"))
+    out["job_salary_max_llm"]      = _float_or_none(sal.get("max"))
+    out["job_salary_currency_llm"] = sal.get("currency")
+    out["job_salary_period_llm"]   = sal.get("period")
+
+    out["job_contract_type_llm"]   = _get(sec, ["contract","type"])
+    out["job_remote_type_llm"]     = _get(sec, ["remote","type"])
+
+    edu = _get(sec, ["education","level"])
+    out["education_level_required_llm"] = edu
+
+    # Keywords
+    out["keywords_job_llm"] = _listify(_get(seg_json, ["job","keywords"], []))
+
+    return out
+
+def llm_env_ok() -> tuple[bool, dict]:
+    info = {
+        "endpoint": bool(AZURE_OPENAI_ENDPOINT),
+        "api_key": bool(AZURE_OPENAI_API_KEY),
+        "api_version": bool(AZURE_OPENAI_API_VER),
+        "deployment": bool(JOBS_LLM_DEPLOYMENT),
+        "segment_toggle": JOBS_LLM_SEGMENT in {"1","true","TRUE","yes","YES"},
+    }
+    ok = all([info["endpoint"], info["api_key"], info["deployment"], info["segment_toggle"]])
+    return ok, info
 
 # =============== Normalisation valeurs ===============
 def norm_status(s: Optional[str]) -> Optional[str]:
@@ -242,6 +483,21 @@ def build_job_row(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "age_days": age_days
         }
     }
+            # --- NEW: LLM segmentation (optionnelle) ---
+    llm_res = segment_job_with_llm(title, body_text, language_code)
+    if llm_res.get("ok"):
+        llm_data = llm_res.get("data") or {}
+        row["job_llm_segments"] = llm_data  # JSON brut complet
+        # aplatissement utile
+        flat = flatten_job_llm_segments(llm_data)
+        row.update(flat)
+        row["job_llm_error"] = None
+    else:
+        row["job_llm_segments"] = None
+        row["job_llm_error"] = llm_res.get("error")
+
+
+
     return row
 
 # =============== Main ===============
@@ -254,6 +510,9 @@ def run():
 
     src_paths = list_json_blobs(container, bronze_jobs_prefix)
     print(f"🔎 {len(src_paths)} jobs Bronze trouvés sous '{bronze_jobs_prefix}'")
+    ok_env, info = llm_env_ok()
+    print("LLM env:", {k: ("OK" if v else "MISSING") for k,v in info.items()})
+
 
     run_ts = utc_iso().replace(":", "-")
     out_path = f"{silver_jobs_prefix}{run_ts}.jsonl"
@@ -286,6 +545,11 @@ def run():
         "counts": {"ok": ok, "failed": bad}
     }
     upload_text(container, manifest_path, jdump(manifest), overwrite=False)
+    llm_ok = sum(1 for line in lines if '"job_llm_segments":' in line and '"job_llm_segments": null' not in line)
+    llm_err = sum(1 for line in lines if '"job_llm_error":' in line and '"job_llm_error": null' not in line)
+
+    manifest["llm_stats"] = {"segments_ok": llm_ok, "segments_error": llm_err}
+    manifest["llm_env"] = info  # utile tant que tu débogues
 
     print("\n=== FIN ===")
     print(jdump(manifest))
